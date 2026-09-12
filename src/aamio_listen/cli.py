@@ -1,0 +1,112 @@
+"""Command line for aamio-listen.
+
+    aamio-listen init [--tags a,b]        make a key and an inbox, print your identity
+    aamio-listen whoami                   your key, hash prefix and inbox
+    aamio-listen partner add NAME KEY     add a partner from the contract
+    aamio-listen partner list
+    aamio-listen partner remove NAME
+    aamio-listen lookup [NAME ...]        who is online now
+    aamio-listen send NAME TEXT           encrypt, sign, send
+    aamio-listen read [--wait 25]         read new messages
+    aamio-listen receipt [--channel inbox] [--anchor]
+    aamio-listen serve                    MCP server on stdio
+
+Environment: AAMIO_HOME (default ~/.aamio), AAMIO_HOST (default https://aamio.at), AAMIO_TAGS.
+"""
+
+import argparse
+import json
+import sys
+
+from . import __version__
+from .runtime import Runtime
+
+
+def out(value):
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="aamio-listen", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--home", default=None)
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--no-archive", action="store_true", help="do not keep decrypted messages and receipts locally")
+    parser.add_argument("--version", action="version", version="aamio-listen " + __version__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("init")
+    p.add_argument("--tags", default=None, help="comma separated presence tags")
+    sub.add_parser("whoami")
+    p = sub.add_parser("partner")
+    ps = p.add_subparsers(dest="action", required=True)
+    pa = ps.add_parser("add")
+    pa.add_argument("name")
+    pa.add_argument("key")
+    ps.add_parser("list")
+    pr = ps.add_parser("remove")
+    pr.add_argument("name")
+    p = sub.add_parser("lookup")
+    p.add_argument("names", nargs="*")
+    p.add_argument("--wait", type=int, default=0)
+    p = sub.add_parser("send")
+    p.add_argument("to")
+    p.add_argument("text")
+    p.add_argument("--data", default=None, help="JSON object")
+    p = sub.add_parser("read")
+    p.add_argument("--wait", type=int, default=0)
+    p = sub.add_parser("receipt")
+    p.add_argument("--channel", default="inbox")
+    p.add_argument("--anchor", action="store_true")
+    p = sub.add_parser("channel")
+    cs = p.add_subparsers(dest="action", required=True)
+    co = cs.add_parser("open")
+    co.add_argument("label")
+    co.add_argument("--ttl", type=int, default=600)
+    co.add_argument("--allow", default=None, help="comma separated partner names")
+    cs.add_parser("list")
+    cc = cs.add_parser("close")
+    cc.add_argument("label")
+    sub.add_parser("serve")
+
+    args = parser.parse_args(argv)
+    tags = [t for t in args.tags.split(",") if t] if getattr(args, "tags", None) else None
+    runtime = Runtime(home=args.home, host=args.host, tags=tags, archive=not args.no_archive, log=lambda line: print(line, file=sys.stderr))
+
+    if args.command == "init":
+        runtime.ensure_inbox()
+        runtime.save_state()
+        out(runtime.whoami())
+    elif args.command == "whoami":
+        out(runtime.whoami())
+    elif args.command == "partner":
+        if args.action == "add":
+            runtime.partner_add(args.name, args.key)
+        elif args.action == "remove":
+            runtime.partner_remove(args.name)
+        out({"partners": runtime.partner_list()})
+    elif args.command == "lookup":
+        runtime.ensure_inbox()
+        out(runtime.lookup(args.names or None, args.wait))
+    elif args.command == "send":
+        data = json.loads(args.data) if args.data else None
+        out(runtime.send(args.to, args.text, data))
+    elif args.command == "read":
+        out({"messages": [{k: v for k, v in m.items() if k != "from_key"} for m in runtime.read(args.wait)]})
+    elif args.command == "receipt":
+        out(runtime.receipt(args.channel, args.anchor))
+    elif args.command == "channel":
+        if args.action == "open":
+            out(runtime.open_channel(args.label, args.ttl, [n for n in args.allow.split(",") if n] if args.allow else None))
+        elif args.action == "list":
+            out({"channels": runtime.channel_list()})
+        else:
+            out(runtime.close_channel(args.label))
+    elif args.command == "serve":
+        from .mcp_server import serve
+
+        serve(runtime)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

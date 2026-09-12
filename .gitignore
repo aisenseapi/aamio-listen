@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+.pytest_cache/
+.agent-state/
+AGENTS.md
+AGENT_CONTEXT.md
