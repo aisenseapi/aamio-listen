@@ -1,0 +1,2 @@
+# Keep every working copy at LF; the package is consumed on every platform.
+* text=auto eol=lf
