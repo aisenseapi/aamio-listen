@@ -91,7 +91,59 @@ def test_two_runtimes_talk():
         shutil.rmtree(base, ignore_errors=True)
 
 
+def test_board():
+    """The open board: post, find by a parent tag, answer sealed, move to a private thread."""
+    base = tempfile.mkdtemp(prefix="aamio-board-test-")
+    poster = Runtime(home=os.path.join(base, "poster"), archive=False)
+    answerer = Runtime(home=os.path.join(base, "answerer"), archive=False)
+    try:
+        posted = poster.board_post("need", "Temperature log for ARC-4471", "The full cold chain log, as JSON.", ["test.board", "coldchain"], 120, "en")
+        post = posted["post"]
+        assert post["w"] == posted["inbox"] and post["lang"] == "en"
+        assert poster.channels["board"].allow == ["*"], "the reply inbox takes any key, signed only"
+
+        found = answerer.board_find(kind="need", tags=["test"])
+        mine = [p for p in found["posts"] if p["id"] == post["id"]]
+        assert mine, "a tag covers its dotted children"
+        assert found["next"] >= post["seq"]
+        assert not [p for p in answerer.board_find(tags=["test.boar"])["posts"] if p["id"] == post["id"]], "a bare prefix is not a tag"
+
+        answered = answerer.board_answer(mine[0], "I have it, 41 h, no excursion")
+        assert answered["post"] == post["id"]
+
+        poster.read(wait=10)
+        replies = poster.board_replies(post["id"])
+        assert len(replies) == 1, replies
+        assert replies[0]["verified"] and replies[0]["from_key"] == answerer.keys.public
+        assert replies[0]["body"]["text"] == "I have it, 41 h, no excursion"
+
+        channel = poster.open_channel_with(replies[0]["from_key"], 120, reply_to=replies[0]["body"]["reply_to"], note="moving here")
+        assert poster.channels[channel["label"]].allow == [answerer.keys.public]
+        answerer.read(wait=10)
+        handed = [e for e in answerer.board_replies() if isinstance(e["body"], dict) and e["body"].get("channel")]
+        assert handed and handed[-1]["body"]["channel"] == channel["w"]
+
+        tree = poster.board_tags()
+        branch = [t for t in tree["tags"] if t["tag"] == "test"]
+        assert branch and branch[0]["live"] >= 1
+        assert any(c["tag"] == "test.board" for c in branch[0]["children"])
+
+        assert poster.board_withdraw(post["id"])["deleted"]
+        assert poster.board_get(post["id"]) is None
+        print("ok: the board, from post to private thread")
+    finally:
+        for runtime in (poster, answerer):
+            for label in list(runtime.channels):
+                try:
+                    runtime.close_channel(label)
+                except Exception:
+                    pass
+            runtime.close()
+        shutil.rmtree(base, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_crypto_roundtrip()
     print("ok: crypto")
     test_two_runtimes_talk()
+    test_board()

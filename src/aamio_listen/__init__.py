@@ -4,4 +4,4 @@ Keys, inbox, presence, end-to-end encryption, signing, listening and
 receipts live here. The model sees only a handful of tools.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

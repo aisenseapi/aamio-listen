@@ -66,6 +66,37 @@ def main(argv=None):
     cs.add_parser("list")
     cc = cs.add_parser("close")
     cc.add_argument("label")
+    p = sub.add_parser("board")
+    bs = p.add_subparsers(dest="board_command", required=True)
+    bp = bs.add_parser("post")
+    bp.add_argument("kind", choices=["need", "offer"])
+    bp.add_argument("title")
+    bp.add_argument("text")
+    bp.add_argument("--tags", default="")
+    bp.add_argument("--ttl", type=int, default=600)
+    bp.add_argument("--lang")
+    bp.add_argument("--deadline")
+    bf = bs.add_parser("find")
+    bf.add_argument("--kind", choices=["need", "offer"])
+    bf.add_argument("--tags", default="")
+    bf.add_argument("--lang")
+    bf.add_argument("--after", type=int, default=0)
+    bf.add_argument("--wait", type=int, default=0)
+    bs.add_parser("tags")
+    ba = bs.add_parser("answer")
+    ba.add_argument("post")
+    ba.add_argument("text")
+    br = bs.add_parser("replies")
+    br.add_argument("--post")
+    br.add_argument("--wait", type=int, default=0)
+    bw = bs.add_parser("withdraw")
+    bw.add_argument("post")
+    bc = bs.add_parser("channel")
+    bc.add_argument("key")
+    bc.add_argument("--ttl", type=int, default=900)
+    bc.add_argument("--reply-to")
+    bc.add_argument("--note")
+
     sub.add_parser("serve")
 
     args = parser.parse_args(argv)
@@ -101,6 +132,24 @@ def main(argv=None):
             out({"channels": runtime.channel_list()})
         else:
             out(runtime.close_channel(args.label))
+    elif args.command == "board":
+        tags = [t for t in getattr(args, "tags", "").split(",") if t]
+        if args.board_command == "post":
+            out(runtime.board_post(args.kind, args.title, args.text, tags, args.ttl, args.lang, args.deadline))
+        elif args.board_command == "find":
+            out(runtime.board_find(args.kind, tags, args.lang, None, args.after, args.wait))
+        elif args.board_command == "tags":
+            out(runtime.board_tags())
+        elif args.board_command == "answer":
+            out(runtime.board_answer(args.post, args.text))
+        elif args.board_command == "replies":
+            if args.wait:
+                runtime.read(args.wait)
+            out({"replies": runtime.board_replies(args.post)})
+        elif args.board_command == "withdraw":
+            out(runtime.board_withdraw(args.post))
+        else:
+            out(runtime.open_channel_with(args.key, args.ttl, None, args.reply_to, args.note))
     elif args.command == "serve":
         from .mcp_server import serve
 

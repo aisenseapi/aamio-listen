@@ -5,6 +5,7 @@ only a transport failure raises. Read keys travel in headers, never in URLs.
 """
 
 import json
+import os
 import random
 import string
 import urllib.error
@@ -13,6 +14,7 @@ import urllib.request
 from .crypto import b64url, sha256hex
 
 DEFAULT_HOST = "https://aamio.at"
+DEFAULT_BOARD = "https://board.aamio.at"
 VERIFYUM_MCP = "https://api.verifyum.com/mcp"
 
 
@@ -30,9 +32,10 @@ def write_address(read_key: str) -> str:
 
 
 class AamioClient:
-    def __init__(self, host: str = DEFAULT_HOST, timeout: int = 60):
+    def __init__(self, host: str = DEFAULT_HOST, timeout: int = 60, board: str = None):
         self.host = host.rstrip("/")
         self.timeout = timeout
+        self.board = (board or os.environ.get("AAMIO_BOARD") or DEFAULT_BOARD).rstrip("/")
 
     def http(self, method: str, url: str, body=None, headers=None, timeout=None):
         data = None
@@ -96,6 +99,23 @@ class AamioClient:
         if wait > 0:
             return self.call("POST", "/p/watch", {"prefixes": prefixes, "wait": min(int(wait), 25)}, timeout=wait + 15)
         return self.call("POST", "/p/lookup", {"prefixes": prefixes})
+
+    # board
+
+    def board_post(self, body_text: str, key: str, signature: str):
+        return self.http("POST", self.board + "/", body_text, {"Content-Type": "application/json", "X-Key": key, "X-Sig": signature})
+
+    def board_find(self, filter_body: dict, wait: int = 0):
+        return self.http("POST", self.board + "/find", filter_body, timeout=wait + 15 if wait else None)
+
+    def board_get(self, post_id: str):
+        return self.http("GET", self.board + "/" + post_id)
+
+    def board_tags(self):
+        return self.http("GET", self.board + "/tags")
+
+    def board_withdraw(self, post_id: str, body_text: str, signature: str):
+        return self.http("DELETE", self.board + "/" + post_id, body_text, {"Content-Type": "application/json", "X-Sig": signature})
 
     # service
 

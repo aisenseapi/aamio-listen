@@ -19,7 +19,7 @@ import threading
 import time
 
 from .client import AamioClient, DEFAULT_HOST
-from .crypto import Keys, is_envelope, is_key, key_hash, presence_signing_input, sha256hex, thread_signing_input, unb64url
+from .crypto import Keys, board_delete_signing_input, board_signing_input, is_envelope, is_key, key_hash, presence_signing_input, sha256hex, thread_signing_input, unb64url
 
 INBOX_TTL = 3600
 PRESENCE_TTL = 120
@@ -231,6 +231,167 @@ class Runtime:
     def channel_list(self):
         return [{"label": c.label, "w": c.w, "expire_at": c.expire_at, "seconds_left": max(0, int(c.expire_at - time.time())), "allow": [self.name_for_key(k) or k for k in c.allow], "received": len(c.received)} for c in self.channels.values()]
 
+
+    # ------------------------------------------------------------ board --
+
+    def ensure_board_inbox(self, seconds=900):
+        """An inbox for board answers: any key, signed only. Reused while it lasts.
+
+        It cannot have an allowlist of partners: whoever answers a post is by
+        definition someone we have not met. X-Allow: * is the middle ground,
+        and the answers themselves are sealed to our key, so the open address
+        does not mean an open conversation.
+        """
+        held = self.channels.get("board")
+        if held and held.expire_at - time.time() > seconds:
+            return held
+        ttl = min(INBOX_TTL, max(int(seconds) + 60, 900))
+        status, data, read_key, w = self.client.open_thread(ttl, ["*"])
+        if status != 201:
+            raise RuntimeError("could not open the board inbox: %s %s" % (status, data))
+        channel = Channel("board", read_key, w, data["expire_at"], ["*"])
+        with self.lock:
+            if held is not None:
+                self.channels["board-%d" % held.expire_at] = held
+            self.channels["board"] = channel
+        self.save_state()
+        self.log("board inbox %s until %d (any key, signed only)" % (w, channel.expire_at))
+        if self.listener is not None:
+            self._start_poller(channel)
+        return channel
+
+    def board_post(self, kind, title, text, tags=None, ttl=600, lang=None, deadline=None):
+        """Put a need or an offer on the board. The reply inbox is opened for you."""
+        channel = self.ensure_board_inbox(int(ttl))
+        fields = {"kind": kind, "title": title, "text": text, "w": channel.w, "ttl": int(ttl)}
+        if tags:
+            fields["tags"] = list(tags)[:8]
+        if lang:
+            fields["lang"] = lang
+        if deadline:
+            fields["deadline"] = deadline
+        body = json.dumps(fields, ensure_ascii=False, separators=(",", ":"))
+        status, data = self.client.board_post(body, self.keys.public, self.keys.sign(board_signing_input(self.keys.public, body)))
+        if status not in (200, 201):
+            raise RuntimeError("board post failed: %s %s" % (status, data))
+        self.archive("board", {"kind": "posted", "at": time.time(), "post": data})
+        return {"post": data, "inbox": channel.w, "answers_arrive_on": "board"}
+
+    def board_find(self, kind=None, tags=None, lang=None, key=None, after=0, wait=0):
+        """Live posts that match. A tag covers its dotted children."""
+        body = {"after": int(after)}
+        if kind:
+            body["kind"] = kind
+        if tags:
+            body["tags"] = list(tags)[:20]
+        if lang:
+            body["lang"] = lang
+        if key:
+            body["key"] = key
+        if wait:
+            body["wait"] = min(int(wait), 25)
+        status, data = self.client.board_find(body, int(wait or 0))
+        if status != 200:
+            raise RuntimeError("board find failed: %s %s" % (status, data))
+        for post in data.get("posts", []):
+            if post.get("w") and post.get("key"):
+                with self.lock:
+                    self.peers[post["w"]] = post["key"]
+        return data
+
+    def board_get(self, post_id):
+        status, data = self.client.board_get(post_id)
+        return data if status == 200 else None
+
+    def board_tags(self):
+        status, data = self.client.board_tags()
+        if status != 200:
+            raise RuntimeError("board tags failed: %s %s" % (status, data))
+        return data
+
+    def board_withdraw(self, post_id):
+        body = json.dumps({"at": int(time.time())}, separators=(",", ":"))
+        status, data = self.client.board_withdraw(post_id, body, self.keys.sign(board_delete_signing_input(post_id, body)))
+        if status != 200:
+            raise RuntimeError("withdraw failed: %s %s" % (status, data))
+        self.archive("board", {"kind": "withdrawn", "at": time.time(), "id": post_id})
+        return data
+
+    def board_answer(self, post, text=None, data=None):
+        """Answer a post, sealed to the poster's key and signed by ours.
+
+        The message carries the post id and our reply address, so the poster
+        can sort answers by post and write back.
+        """
+        if isinstance(post, str):
+            post = self.board_get(post)
+            if post is None:
+                raise LookupError("no live post with that id")
+        channel = self.ensure_board_inbox()
+        with self.lock:
+            self.peers[post["w"]] = post["key"]
+        body = {"post": post["id"], "reply_to": channel.w, "from": self.keys.hash[:8]}
+        if text is not None:
+            body["text"] = str(text)
+        if data is not None:
+            body["data"] = data
+        plaintext = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        envelope = self.keys.seal(post["key"], plaintext)
+        status, result = self.client.post(post["w"], envelope, self.keys.public, self.keys.sign(thread_signing_input(post["w"], envelope)))
+        self.archive("board", {"kind": "answered", "at": time.time(), "post": post["id"], "w": post["w"], "status": status, "body": body})
+        if status != 201:
+            raise RuntimeError("answer failed: %s %s" % (status, result))
+        return {"post": post["id"], "w": post["w"], "seq": result["seq"], "at": result["at"], "replies_arrive_on": "board", "reply_to": channel.w}
+
+    def board_replies(self, post_id=None):
+        """Answers received on the board inbox, decrypted and verified, newest last."""
+        out = []
+        for label, channel in list(self.channels.items()):
+            if not label.startswith("board"):
+                continue
+            with channel.lock:
+                for entry in channel.received:
+                    body = entry.get("body")
+                    if not isinstance(body, dict):
+                        continue
+                    if post_id is None or body.get("post") == post_id:
+                        out.append(entry)
+        return sorted(out, key=lambda e: e["at"])
+
+    def open_channel_with(self, key, ttl=900, label=None, reply_to=None, note=None):
+        """A private channel only that key may write to, with its address handed over.
+
+        This is how a conversation leaves the open board inbox: one answer
+        there, then everything else in a thread nobody else can write to.
+        """
+        if not is_key(str(key)):
+            partner = self.partner_by_name(str(key))
+            if partner is None:
+                raise ValueError("not a key and not a known partner: " + str(key))
+            key = partner["key"]
+        label = label or ("with-" + key_hash(key)[:8])
+        if label in self.channels:
+            label = "%s-%d" % (label, int(time.time()))
+        status, data, read_key, w = self.client.open_thread(int(ttl), [key])
+        if status != 201:
+            raise RuntimeError("could not open channel: %s %s" % (status, data))
+        channel = Channel(label, read_key, w, data["expire_at"], [key])
+        with self.lock:
+            self.channels[label] = channel
+        self.save_state()
+        if self.listener is not None:
+            self._start_poller(channel)
+        handed = None
+        if reply_to:
+            body = {"channel": w, "expire_at": channel.expire_at}
+            if note:
+                body["text"] = str(note)
+            envelope = self.keys.seal(key, json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            status, handed = self.client.post(reply_to, envelope, self.keys.public, self.keys.sign(thread_signing_input(reply_to, envelope)))
+            if status != 201:
+                raise RuntimeError("channel opened but the address could not be handed over: %s %s" % (status, handed))
+        return {"label": label, "w": w, "expire_at": channel.expire_at, "with": self.name_for_key(key) or key, "address_sent_to": reply_to}
+
     # ----------------------------------------------------------- lookup --
 
     def lookup(self, names=None, wait=0):
@@ -353,6 +514,14 @@ class Runtime:
                 self.log("poller %s: %s" % (channel.label, error))
                 time.sleep(3)
         channel.poller = None
+
+    def _start_poller(self, channel):
+        """One poller for a channel opened after the listener started."""
+        if channel.poller is not None and channel.poller.is_alive():
+            return
+        poller = threading.Thread(target=self._poll_loop, args=(channel,), daemon=True)
+        channel.poller = poller
+        poller.start()
 
     def _listen(self):
         """Keeps the inbox alive and presence fresh, and gives every channel a poller."""

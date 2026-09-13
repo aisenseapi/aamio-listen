@@ -65,6 +65,14 @@ def presence_delete_signing_input(key: str, body_text: str) -> str:
     return "aamio-presence-delete-v1\n" + key + "\n" + sha256hex(body_text)
 
 
+def board_signing_input(key: str, body_text: str) -> str:
+    return "aamio-board-v1\n" + key + "\n" + sha256hex(body_text)
+
+
+def board_delete_signing_input(post_id: str, body_text: str) -> str:
+    return "aamio-board-delete-v1\n" + post_id + "\n" + sha256hex(body_text)
+
+
 class Keys:
     """A runtime identity: one seed, an Ed25519 pair for signing and an X25519 pair for boxes."""
 
