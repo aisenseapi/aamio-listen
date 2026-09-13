@@ -139,3 +139,30 @@ def test_a_sender_cannot_set_our_own_fields():
     assert entry["signed"] is True and entry["format"] == "json" and entry["encrypted"] is False
     assert entry["verified"] is True
     assert entry["body"]["format"] == "sealed"
+
+
+def test_an_answer_on_another_channel_is_still_found():
+    """Sealed to its own reply address, so it lands off the board inbox.
+
+    Scoping the search to channels named "board" hid these, and a poster who
+    looked only at board replies saw nothing while read() had the message.
+    """
+    runtime = object.__new__(Runtime)
+    board = Channel("board", "r1", "b" * 20, 2000000000)
+    private = Channel("Arctic Freight", "r2", "c" * 20, 2000000000)
+    runtime.channels = {"board": board, "Arctic Freight": private}
+    private.received.append({"channel": "Arctic Freight", "at": 5, "body": {"post": "p1", "text": "yes"}})
+    board.received.append({"channel": "board", "at": 4, "body": {"post": "p2", "text": "other"}})
+
+    found = runtime.board_replies("p1")
+    assert len(found) == 1 and found[0]["channel"] == "Arctic Freight"
+    # Asking for everything still lists both, oldest first.
+    assert [e["at"] for e in runtime.board_replies()] == [4, 5]
+
+
+def test_a_private_thread_does_not_become_a_list_of_board_answers():
+    runtime = object.__new__(Runtime)
+    private = Channel("Arctic Freight", "r2", "c" * 20, 2000000000)
+    runtime.channels = {"Arctic Freight": private}
+    private.received.append({"channel": "Arctic Freight", "at": 5, "body": {"text": "an ordinary message"}})
+    assert runtime.board_replies() == []

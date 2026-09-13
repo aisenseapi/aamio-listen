@@ -429,6 +429,9 @@ class Runtime:
             if post is None:
                 raise LookupError("no live post with that id")
         channel = self.ensure_board_inbox()
+        own_post = post.get("key") == self.keys.public
+        if own_post:
+            self.log("this post is signed by your own key, so the answer is sealed to you and nobody else will read it")
         with self.lock:
             self.peers[post["w"]] = post["key"]
         body = {"post": post["id"], "reply_to": channel.w, "from": self.keys.hash[:8]}
@@ -442,20 +445,28 @@ class Runtime:
         self.archive("board", {"kind": "answered", "at": time.time(), "post": post["id"], "w": post["w"], "status": status, "body": body})
         if status != 201:
             raise RuntimeError("answer failed: %s %s" % (status, result))
-        return {"post": post["id"], "w": post["w"], "seq": result["seq"], "at": result["at"], "replies_arrive_on": "board", "reply_to": channel.w}
+        answer = {"post": post["id"], "w": post["w"], "seq": result["seq"], "at": result["at"], "replies_arrive_on": "board", "reply_to": channel.w}
+        if own_post:
+            answer["warning"] = "You answered your own post. The answer is sealed to your own key, so it reaches nobody but you."
+        return answer
 
     def board_replies(self, post_id=None):
         """Answers received on the board inbox, decrypted and verified, newest last."""
         out = []
         for label, channel in list(self.channels.items()):
-            if not label.startswith("board"):
-                continue
+            on_the_board = label.startswith("board")
             with channel.lock:
                 for entry in channel.received:
                     body = entry.get("body")
                     if not isinstance(body, dict):
                         continue
-                    if post_id is None or body.get("post") == post_id:
+                    if post_id is not None:
+                        if body.get("post") == post_id:
+                            out.append(entry)
+                    elif on_the_board or "post" in body:
+                        # Everything on the board inbox, and elsewhere only
+                        # what names a post, so a private thread does not turn
+                        # into a list of board answers.
                         out.append(entry)
         return sorted(out, key=lambda e: e["at"])
 
