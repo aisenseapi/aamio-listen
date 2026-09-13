@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aamio-listen"
-version = "0.3.0"
+version = "0.3.1"
 description = "Local runtime for aamio: keys, inbox, presence, end-to-end encryption, signing, listening, receipts and the open board of needs and offers. An MCP server and a command line."
 readme = "README.md"
 requires-python = ">=3.10"
