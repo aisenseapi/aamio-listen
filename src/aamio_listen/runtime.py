@@ -681,42 +681,97 @@ class Runtime:
 
     # ------------------------------------------------------------- read --
 
-    ALIASES = {"post": ("post", "post_id", "postId", "id"), "reply_to": ("reply_to", "replyTo", "w", "reply_address"), "text": ("text", "reply", "body", "message")}
+    # Only the spellings seen in the wild, and only for an answer to a post.
+    # A blanket id -> post or w -> reply_to would rewrite other message kinds
+    # into something they are not.
+    ANSWER_ALIASES = {
+        "post": ("post_id", "postId"),
+        "reply_to": ("replyTo", "w", "reply_address"),
+        "text": ("reply", "message"),
+    }
 
     @classmethod
     def _canonical(cls, body):
         """The documented field names, from whatever a sender called them.
 
-        The shape is written down in three places and still gets guessed at.
+        The shape is written down in several places and still gets guessed at.
         A signed, useful answer that says post_id instead of post is not worth
-        dropping on the floor: take it, and record what it was called so the
-        difference is visible rather than silently smoothed over.
+        dropping on the floor. We stay strict in what we send.
+
+        Returns the body and a note of what was renamed, kept apart from the
+        body so a sender cannot put anything of ours in it.
         """
         if not isinstance(body, dict):
-            return body
-        renamed = {}
-        for canonical, spellings in cls.ALIASES.items():
+            return body, {}
+
+        # Normalise an answer to a post, nothing else: without a post id in
+        # some spelling this is a different kind of message and is left alone.
+        if not any(name in body for name in ("post",) + cls.ANSWER_ALIASES["post"]):
+            return body, {}
+
+        renamed, conflicts = {}, {}
+
+        for canonical, spellings in cls.ANSWER_ALIASES.items():
+            present = [s for s in spellings if isinstance(body.get(s), (str, int))]
+
             if canonical in body:
+                # Both spellings, disagreeing: the canonical one wins and the
+                # disagreement is reported rather than quietly dropped.
+                conflicts.update({s: body[s] for s in present if str(body[s]) != str(body[canonical])})
                 continue
-            for spelling in spellings:
-                if spelling in body and isinstance(body[spelling], (str, int)):
-                    body[canonical] = body[spelling]
-                    renamed[spelling] = canonical
-                    break
+
+            if present:
+                body[canonical] = body[present[0]]
+                renamed[present[0]] = canonical
+                conflicts.update({s: body[s] for s in present[1:]})
+
+        meta = {}
+
         if renamed:
-            body["_renamed"] = renamed
-        return body
+            meta["renamed"] = renamed
+
+        if conflicts:
+            meta["conflicting_fields"] = conflicts
+
+        return body, meta
 
     def _open(self, message):
+        """What was said, and separately, what can be trusted about it.
+
+        The two used to be one dict, so a plaintext JSON answer arrived as a
+        wrapper with the real object stranded inside a string. Nothing
+        downstream could see the fields, the answer was never matched to its
+        post, and the reply address was never learned. Keeping the content and
+        the metadata apart also means no sender can set a field of ours.
+        """
+        raw = message["body"]
+
         if not message.get("verified") or not message.get("from"):
-            return {"unsigned": True, "text": message["body"][:500]}
-        if not is_envelope(message["body"]):
-            return {"plaintext": True, "text": message["body"][:500]}
+            return {"text": raw}, {"signed": False, "encrypted": False, "format": "unsigned"}
+
+        if not is_envelope(raw):
+            try:
+                parsed = json.loads(raw)
+            except ValueError:
+                return {"text": raw}, {"signed": True, "encrypted": False, "format": "text"}
+
+            if isinstance(parsed, dict):
+                content, extra = self._canonical(parsed)
+                return content, dict({"signed": True, "encrypted": False, "format": "json"}, **extra)
+
+            return {"text": raw}, {"signed": True, "encrypted": False, "format": "json"}
+
         try:
-            plaintext = self.keys.open(message["from"], message["body"])
-            return json.loads(plaintext.decode("utf-8"))
+            plaintext = self.keys.open(message["from"], raw)
+            parsed = json.loads(plaintext.decode("utf-8"))
         except Exception as error:
-            return {"undecryptable": error.__class__.__name__}
+            return {"text": None}, {"signed": True, "encrypted": True, "format": "unreadable", "error": error.__class__.__name__}
+
+        if isinstance(parsed, dict):
+            content, extra = self._canonical(parsed)
+            return content, dict({"signed": True, "encrypted": True, "format": "json"}, **extra)
+
+        return {"text": parsed}, {"signed": True, "encrypted": True, "format": "json"}
 
     def poll(self, channel, wait=0):
         status, data = self.client.read(channel.w, channel.read_key, channel.after, wait)
@@ -728,7 +783,9 @@ class Runtime:
         for message in data.get("messages", []):
             entry = {"channel": channel.label, "seq": message["seq"], "at": message["at"], "verified": message["verified"], "from_key": message["from"], "sender": self.name_for_key(message["from"]) or ("unknown key" if message["from"] else "unsigned"), "sha256": message["sha256"], "replay": message["sha256"] in channel.seen}
             channel.seen.add(message["sha256"])
-            entry["body"] = self._canonical(self._open(message))
+            body, meta = self._open(message)
+            entry["body"] = body
+            entry.update(meta)
             if isinstance(entry["body"], dict) and isinstance(entry["body"].get("reply_to"), str) and message["from"]:
                 with self.lock:
                     self.peers[entry["body"]["reply_to"]] = message["from"]
