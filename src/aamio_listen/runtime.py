@@ -31,6 +31,27 @@ def home_dir() -> str:
     return os.environ.get("AAMIO_HOME") or os.path.join(os.path.expanduser("~"), ".aamio")
 
 
+# Homes locked by this process. The file on disk catches another process;
+# this catches two runtimes in one, which is just as bad for the state.
+_LOCKED_HOMES = set()
+
+
+class SendFailed(RuntimeError):
+    """A send that did not end in a stored message.
+
+    outcome is refused when aamio answered and said no, and unknown when no
+    answer came back at all. Unknown is not failure: the message may be on
+    the other side. The entry stays in the outbox under message_id.
+    """
+
+    def __init__(self, outcome, message_id, status, detail):
+        super().__init__("send %s (http %s): %s" % (outcome, status, detail))
+        self.outcome = outcome
+        self.message_id = message_id
+        self.status = status
+        self.detail = detail
+
+
 class Channel:
     def __init__(self, label, read_key, w, expire_at, allow=None, after=0):
         self.label = label
@@ -46,11 +67,16 @@ class Channel:
         self.closed = False
 
     def to_state(self):
-        return {"label": self.label, "read_key": self.read_key, "w": self.w, "expire_at": self.expire_at, "allow": self.allow, "after": self.after}
+        # seen travels with the channel: without it a restart cannot tell a
+        # redelivered message from a new one, and the model may act twice.
+        return {"label": self.label, "read_key": self.read_key, "w": self.w, "expire_at": self.expire_at, "allow": self.allow, "after": self.after, "seen": sorted(self.seen)}
 
     @classmethod
     def from_state(cls, item):
-        return cls(item["label"], item["read_key"], item["w"], item["expire_at"], item.get("allow"), item.get("after", 0))
+        channel = cls(item["label"], item["read_key"], item["w"], item["expire_at"], item.get("allow"), item.get("after", 0))
+        channel.seen = set(item.get("seen") or [])
+
+        return channel
 
 
 class Runtime:
@@ -62,6 +88,7 @@ class Runtime:
         self.log = log or (lambda line: None)
         os.makedirs(self.home, exist_ok=True)
         os.makedirs(os.path.join(self.home, "archive"), exist_ok=True)
+        self.owns_lock = self._take_lock()
         self.keys = self._load_or_create_keys()
         self.partners = self._load_json("partners.json", [])
         state = self._load_json("state.json", {})
@@ -72,11 +99,67 @@ class Runtime:
             channel = Channel.from_state(item)
             if channel.expire_at > time.time():
                 self.channels[channel.label] = channel
+        self.outbox = self._load_json("outbox.json", {})
+        self.effects = self._load_json("effects.json", {})
+        # Anything still pending was in flight when the last process stopped.
+        # Whether it reached aamio is unknown, and it stays unknown until
+        # somebody looks. Retrying is a decision, not a default.
+        for entry in self.outbox.values():
+            if entry.get("status") == "sending":
+                entry["status"] = "unknown"
+                entry["note"] = "the process stopped while this was in flight"
         self.presence_at = 0.0
         self.inbound = queue.Queue()
         self.lock = threading.RLock()
         self.stop = threading.Event()
         self.listener = None
+
+    # -------------------------------------------------------------- lock --
+
+    def _take_lock(self):
+        """One live runtime per home. Two would overwrite each other's state.
+
+        The file holds the pid, and a pid that is gone is not an owner. This
+        catches the ordinary mistake, two sidecars on one home, not a shared
+        network filesystem.
+        """
+        real = os.path.realpath(self.home)
+
+        if real in _LOCKED_HOMES:
+            raise RuntimeError("another aamio-listen in this process is already using %s" % self.home)
+
+        held = self._load_json("lock", None)
+
+        if isinstance(held, dict) and isinstance(held.get("pid"), int) and held["pid"] != os.getpid():
+            alive = True
+            try:
+                os.kill(held["pid"], 0)
+            except OSError:
+                alive = False
+            except Exception:
+                alive = True
+
+            if alive:
+                raise RuntimeError(
+                    "another aamio-listen (pid %s) is using %s. Stop it, or use a different AAMIO_HOME." % (held["pid"], self.home)
+                )
+
+        self._save_json("lock", {"pid": os.getpid(), "at": int(time.time()), "host": self.host})
+        _LOCKED_HOMES.add(real)
+
+        return True
+
+    def _release_lock(self):
+        if not getattr(self, "owns_lock", False):
+            return
+        held = self._load_json("lock", None)
+        if isinstance(held, dict) and held.get("pid") == os.getpid():
+            try:
+                os.unlink(self._path("lock"))
+            except OSError:
+                pass
+        _LOCKED_HOMES.discard(os.path.realpath(self.home))
+        self.owns_lock = False
 
     # ----------------------------------------------------------- storage --
 
@@ -94,6 +177,9 @@ class Runtime:
         path = self._path(name)
         with open(path + ".tmp", "w", encoding="utf-8") as handle:
             json.dump(value, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            # The rename is atomic, but only over bytes that reached the disk.
+            os.fsync(handle.fileno())
         os.replace(path + ".tmp", path)
         if private:
             try:
@@ -119,6 +205,14 @@ class Runtime:
     def save_state(self):
         with self.lock:
             self._save_json("state.json", {"tags": self.tags, "peers": self.peers, "channels": [c.to_state() for c in self.channels.values()]}, private=True)
+
+    def save_outbox(self):
+        with self.lock:
+            self._save_json("outbox.json", self.outbox, private=True)
+
+    def save_effects(self):
+        with self.lock:
+            self._save_json("effects.json", self.effects)
 
     def archive(self, label, record):
         if not self.archive_enabled:
@@ -449,19 +543,134 @@ class Runtime:
             body["data"] = data
         plaintext = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         envelope = self.keys.seal(key, plaintext)
-        signature = self.keys.sign(thread_signing_input(w, envelope))
-        status, result = self.client.post(w, envelope, self.keys.public, signature)
+        # The entry exists before the first attempt, and every retry sends the
+        # same bytes. The recipient hashes those bytes, so a message that
+        # lands twice is marked a replay there instead of acted on twice.
+        entry = self._outbox_add(w, key, envelope, body)
+        status, result = self._deliver(entry)
+
         if status in (404, 410) and not (isinstance(to, str) and to == w):
             # The partner may have renewed its inbox. Ask presence again, once.
+            # A new address means new bytes, so this is a new outbox entry.
             w, key = self.address_for(to)
             envelope = self.keys.seal(key, plaintext)
-            signature = self.keys.sign(thread_signing_input(w, envelope))
-            status, result = self.client.post(w, envelope, self.keys.public, signature)
-        record = {"kind": "sent", "at": time.time(), "to": self.name_for_key(key) or key, "w": w, "status": status, "seq": (result or {}).get("seq") if isinstance(result, dict) else None, "sha256": (result or {}).get("sha256") if isinstance(result, dict) else None, "body": body}
+            entry = self._outbox_add(w, key, envelope, body, replaces=entry["id"])
+            status, result = self._deliver(entry)
+
+        record = {"kind": "sent", "at": time.time(), "to": self.name_for_key(key) or key, "w": entry["w"], "status": status, "message_id": entry["id"], "outcome": entry["status"], "seq": (result or {}).get("seq") if isinstance(result, dict) else None, "sha256": (result or {}).get("sha256") if isinstance(result, dict) else None, "body": body}
         self.archive("sent", record)
+
         if status != 201:
-            raise RuntimeError("send failed: %s %s" % (status, result))
-        return {"to": record["to"], "w": w, "seq": result["seq"], "at": result["at"], "sha256": result["sha256"], "expire_at": result["expire_at"]}
+            raise SendFailed(entry["status"], entry["id"], status, result)
+
+        return {"to": record["to"], "w": entry["w"], "message_id": entry["id"], "seq": result["seq"], "at": result["at"], "sha256": result["sha256"], "expire_at": result["expire_at"]}
+
+
+    # ----------------------------------------------------------- outbox --
+
+    def _outbox_add(self, w, key, envelope, body, replaces=None):
+        """One durable entry per logical message, written before the first attempt."""
+        entry = {
+            "id": "m-" + sha256hex("%s|%s|%s" % (self.keys.public, w, envelope))[:16],
+            "w": w,
+            "to_key": key,
+            "envelope": envelope,
+            "summary": {k: v for k, v in body.items() if k in ("post", "reply_to", "channel")},
+            "created_at": int(time.time()),
+            "attempts": 0,
+            "status": "sending",
+            "last_status": None,
+            "replaces": replaces,
+        }
+        with self.lock:
+            self.outbox[entry["id"]] = entry
+        self.save_outbox()
+
+        return entry
+
+    def _deliver(self, entry):
+        """Send the stored bytes once, and record what the answer allows us to claim."""
+        entry["attempts"] += 1
+        entry["status"] = "sending"
+        self.save_outbox()
+        signature = self.keys.sign(thread_signing_input(entry["w"], entry["envelope"]))
+        status, result = self.client.post(entry["w"], entry["envelope"], self.keys.public, signature)
+        entry["last_status"] = status
+        entry["last_at"] = int(time.time())
+
+        if status == 201:
+            entry["status"] = "delivered"
+            entry["seq"] = (result or {}).get("seq") if isinstance(result, dict) else None
+        elif status == 0:
+            # No reply. The bytes may have arrived, so this is not a failure
+            # we are allowed to call a failure.
+            entry["status"] = "unknown"
+        else:
+            entry["status"] = "refused"
+            entry["error"] = (result or {}).get("error") if isinstance(result, dict) else str(result)[:200]
+
+        self.save_outbox()
+
+        return status, result
+
+    def outbox_pending(self):
+        """Messages whose fate is not settled: in flight, or unknown after a stop."""
+        return [dict(e) for e in self.outbox.values() if e["status"] in ("sending", "unknown")]
+
+    def outbox_retry(self, message_id=None):
+        """Send the same bytes again for entries that never got a clear answer.
+
+        The recipient marks a second copy as a replay, so this is safe for the
+        transport. Whether the action behind the message is safe to repeat is
+        the application's contract, not this function's.
+        """
+        out = []
+        for entry in list(self.outbox.values()):
+            if message_id is not None and entry["id"] != message_id:
+                continue
+            if entry["status"] not in ("unknown", "refused"):
+                continue
+            if entry["status"] == "refused" and entry.get("last_status") in (403, 410, 413, 415):
+                continue
+            status, _ = self._deliver(entry)
+            out.append({"id": entry["id"], "w": entry["w"], "status": entry["status"], "http": status})
+
+        return out
+
+    def outbox_forget(self, message_id):
+        """Drop an entry once its fate no longer matters. Nothing is retried after this."""
+        with self.lock:
+            entry = self.outbox.pop(message_id, None)
+        self.save_outbox()
+
+        return {"id": message_id, "forgotten": entry is not None}
+
+    # ---------------------------------------------------------- effects --
+
+    def effect(self, key, fingerprint=None):
+        """Has this operation already been carried out here?
+
+        The key is the application's, not a guess from the text: something
+        that names the sender, the task and the action. Returns new, done or
+        conflict, and the stored result when there is one.
+        """
+        record = self.effects.get(str(key))
+
+        if record is None:
+            return {"state": "new", "key": key}
+
+        if fingerprint is not None and record.get("fingerprint") not in (None, fingerprint):
+            return {"state": "conflict", "key": key, "stored_fingerprint": record.get("fingerprint"), "result": record.get("result")}
+
+        return {"state": "done", "key": key, "result": record.get("result"), "at": record.get("at")}
+
+    def effect_done(self, key, result=None, fingerprint=None):
+        """Record that it was carried out, before telling anyone it was."""
+        with self.lock:
+            self.effects[str(key)] = {"fingerprint": fingerprint, "result": result, "at": int(time.time())}
+        self.save_effects()
+
+        return {"state": "done", "key": key, "result": result}
 
     # ------------------------------------------------------------- read --
 
@@ -495,6 +704,10 @@ class Runtime:
                 channel.received.append(entry)
             self.archive(channel.label, dict(entry, kind="received"))
         if entries:
+            # The cursor moves and the hashes are stored in the same save, and
+            # that save happens before the caller sees a single message. A
+            # crash after this point redelivers nothing; a crash before it
+            # redelivers everything, and the stored hashes mark those replays.
             channel.after = max(channel.after, entries[-1]["seq"])
             self.save_state()
         return "ok", entries
@@ -601,3 +814,5 @@ class Runtime:
     def close(self):
         self.stop.set()
         self.save_state()
+        self.save_outbox()
+        self._release_lock()

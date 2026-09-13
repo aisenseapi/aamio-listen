@@ -53,6 +53,11 @@ class AamioClient:
                 status, text = response.status, response.read().decode("utf-8")
         except urllib.error.HTTPError as error:
             status, text = error.code, error.read().decode("utf-8", "replace")
+        except Exception as error:
+            # No reply at all: connection refused, timeout, DNS, a dropped
+            # socket after the bytes went out. Whether the service saw the
+            # request is unknown, and status 0 says exactly that.
+            return 0, {"error": "no response", "detail": error.__class__.__name__}
         try:
             return status, (json.loads(text) if text else None)
         except ValueError:

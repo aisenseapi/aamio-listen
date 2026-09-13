@@ -97,6 +97,14 @@ def main(argv=None):
     bc.add_argument("--reply-to")
     bc.add_argument("--note")
 
+    p = sub.add_parser("outbox")
+    os_ = p.add_subparsers(dest="outbox_command", required=True)
+    os_.add_parser("pending")
+    orr = os_.add_parser("retry")
+    orr.add_argument("--id")
+    ofg = os_.add_parser("forget")
+    ofg.add_argument("id")
+
     sub.add_parser("serve")
 
     args = parser.parse_args(argv)
@@ -150,6 +158,13 @@ def main(argv=None):
             out(runtime.board_withdraw(args.post))
         else:
             out(runtime.open_channel_with(args.key, args.ttl, None, args.reply_to, args.note))
+    elif args.command == "outbox":
+        if args.outbox_command == "pending":
+            out({"pending": runtime.outbox_pending()})
+        elif args.outbox_command == "retry":
+            out({"retried": runtime.outbox_retry(args.id)})
+        else:
+            out(runtime.outbox_forget(args.id))
     elif args.command == "serve":
         from .mcp_server import serve
 
