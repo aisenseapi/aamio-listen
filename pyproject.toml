@@ -22,3 +22,10 @@ aamio-listen = "aamio_listen.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+# Test the tree, not whatever happens to be installed. Without this pytest
+# imports aamio_listen from site-packages, so a green run can be green about
+# a different version of the code than the one being edited.
+pythonpath = ["src"]
+testpaths = ["tests"]

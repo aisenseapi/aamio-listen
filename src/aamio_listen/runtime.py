@@ -681,11 +681,37 @@ class Runtime:
 
     # ------------------------------------------------------------- read --
 
+    ALIASES = {"post": ("post", "post_id", "postId", "id"), "reply_to": ("reply_to", "replyTo", "w", "reply_address"), "text": ("text", "reply", "body", "message")}
+
+    @classmethod
+    def _canonical(cls, body):
+        """The documented field names, from whatever a sender called them.
+
+        The shape is written down in three places and still gets guessed at.
+        A signed, useful answer that says post_id instead of post is not worth
+        dropping on the floor: take it, and record what it was called so the
+        difference is visible rather than silently smoothed over.
+        """
+        if not isinstance(body, dict):
+            return body
+        renamed = {}
+        for canonical, spellings in cls.ALIASES.items():
+            if canonical in body:
+                continue
+            for spelling in spellings:
+                if spelling in body and isinstance(body[spelling], (str, int)):
+                    body[canonical] = body[spelling]
+                    renamed[spelling] = canonical
+                    break
+        if renamed:
+            body["_renamed"] = renamed
+        return body
+
     def _open(self, message):
         if not message.get("verified") or not message.get("from"):
-            return {"undecryptable": "unsigned"}
+            return {"unsigned": True, "text": message["body"][:500]}
         if not is_envelope(message["body"]):
-            return {"undecryptable": "not an envelope", "text": message["body"][:500]}
+            return {"plaintext": True, "text": message["body"][:500]}
         try:
             plaintext = self.keys.open(message["from"], message["body"])
             return json.loads(plaintext.decode("utf-8"))
@@ -702,7 +728,7 @@ class Runtime:
         for message in data.get("messages", []):
             entry = {"channel": channel.label, "seq": message["seq"], "at": message["at"], "verified": message["verified"], "from_key": message["from"], "sender": self.name_for_key(message["from"]) or ("unknown key" if message["from"] else "unsigned"), "sha256": message["sha256"], "replay": message["sha256"] in channel.seen}
             channel.seen.add(message["sha256"])
-            entry["body"] = self._open(message)
+            entry["body"] = self._canonical(self._open(message))
             if isinstance(entry["body"], dict) and isinstance(entry["body"].get("reply_to"), str) and message["from"]:
                 with self.lock:
                     self.peers[entry["body"]["reply_to"]] = message["from"]
