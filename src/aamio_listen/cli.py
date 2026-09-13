@@ -19,7 +19,7 @@ import json
 import sys
 
 from . import __version__
-from .runtime import Runtime
+from .runtime import Runtime, BOARD_TTL
 
 
 def out(value):
@@ -73,7 +73,7 @@ def main(argv=None):
     bp.add_argument("title")
     bp.add_argument("text")
     bp.add_argument("--tags", default="")
-    bp.add_argument("--ttl", type=int, default=600)
+    bp.add_argument("--ttl", type=int, default=BOARD_TTL)
     bp.add_argument("--lang")
     bp.add_argument("--deadline")
     bf = bs.add_parser("find")

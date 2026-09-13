@@ -12,7 +12,7 @@ import sys
 import time
 
 from . import __version__
-from .runtime import Runtime
+from .runtime import Runtime, BOARD_TTL
 
 SUPPORTED = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"]
 
@@ -67,7 +67,7 @@ def dispatch(runtime: Runtime, name: str, arguments: dict):
         if name == "aamio_channels":
             return result_of({"channels": runtime.channel_list()})
         if name == "aamio_board_post":
-            return result_of(runtime.board_post(arguments["kind"], arguments["title"], arguments["text"], arguments.get("tags"), int(arguments.get("ttl") or 600), arguments.get("lang"), arguments.get("deadline")))
+            return result_of(runtime.board_post(arguments["kind"], arguments["title"], arguments["text"], arguments.get("tags"), int(arguments.get("ttl") or BOARD_TTL), arguments.get("lang"), arguments.get("deadline")))
         if name == "aamio_board_find":
             return result_of(runtime.board_find(arguments.get("kind"), arguments.get("tags"), arguments.get("lang"), None, int(arguments.get("after") or 0), int(arguments.get("wait") or 0)))
         if name == "aamio_board_answer":

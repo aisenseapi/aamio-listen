@@ -166,3 +166,39 @@ def test_a_private_thread_does_not_become_a_list_of_board_answers():
     runtime.channels = {"Arctic Freight": private}
     private.received.append({"channel": "Arctic Freight", "at": 5, "body": {"text": "an ordinary message"}})
     assert runtime.board_replies() == []
+
+
+def test_one_undecodable_message_does_not_cost_the_others():
+    """A sender can put anything in a field. It must reach one message only."""
+    runtime = object.__new__(Runtime)
+    channel = Channel("board", "read-key", "b" * 20, 2000000000)
+    runtime.channels = {"board": channel}
+    runtime.lock = threading.Lock()
+    runtime.peers = {}
+    runtime.name_for_key = lambda key: None
+    runtime.archive = lambda *args: None
+    runtime.save_state = lambda: None
+    messages = [
+        {"verified": True, "from": "k", "body": json.dumps({"post": "p1", "text": {"toString": 1}, "reply": "hi"}), "seq": 1, "at": 1, "sha256": "h1"},
+        {"verified": True, "from": "k", "body": json.dumps({"post": "p1", "text": "an ordinary answer"}), "seq": 2, "at": 2, "sha256": "h2"},
+    ]
+    runtime.client = SimpleNamespace(read=lambda *args: (200, {"messages": messages}))
+    status, entries = runtime.poll(channel)
+    assert status == "ok" and len(entries) == 2
+    assert entries[1]["body"]["text"] == "an ordinary answer"
+
+
+def test_a_field_holding_an_object_is_not_compared_to_a_string():
+    # str() of a dict never raises, so the old code reported a conflict that
+    # was not one. Two values are only comparable when both are scalars.
+    body, meta = Runtime._canonical({"post": "p1", "text": {"toString": 1}, "reply": "hi"})
+    assert body["text"] == {"toString": 1}
+    assert "conflicting_fields" not in meta
+
+
+def test_the_board_default_is_one_value_in_one_place():
+    import aamio_listen.runtime as runtime_module
+    import inspect
+    assert runtime_module.BOARD_TTL == 1800
+    # The signature reads the constant, so there is no second copy to drift.
+    assert inspect.signature(Runtime.board_post).parameters["ttl"].default == runtime_module.BOARD_TTL

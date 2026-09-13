@@ -22,6 +22,10 @@ from .client import AamioClient, DEFAULT_HOST
 from .crypto import Keys, board_delete_signing_input, board_signing_input, is_envelope, is_key, key_hash, presence_signing_input, sha256hex, thread_signing_input, unb64url
 
 INBOX_TTL = 3600
+# The board's own default, mirrored here so an ordinary post gets the same
+# lifetime whether the field is sent or left out. The board decides; this is a
+# copy, and it is the only copy in this client.
+BOARD_TTL = 1800
 PRESENCE_TTL = 120
 PRESENCE_REFRESH = 60
 RENEW_BEFORE = 180
@@ -354,7 +358,7 @@ class Runtime:
             self._start_poller(channel)
         return channel
 
-    def board_post(self, kind, title, text, tags=None, ttl=600, lang=None, deadline=None):
+    def board_post(self, kind, title, text, tags=None, ttl=BOARD_TTL, lang=None, deadline=None):
         """Put a need or an offer on the board. The reply inbox is opened for you."""
         channel = self.ensure_board_inbox(int(ttl))
         # The board refuses a post that would outlive the inbox behind it, so
@@ -727,8 +731,11 @@ class Runtime:
 
             if canonical in body:
                 # Both spellings, disagreeing: the canonical one wins and the
-                # disagreement is reported rather than quietly dropped.
-                conflicts.update({s: body[s] for s in present if str(body[s]) != str(body[canonical])})
+                # disagreement is reported rather than quietly dropped. Two
+                # values are only comparable when both are scalars; a field
+                # holding an object is left exactly as the sender wrote it.
+                if isinstance(body[canonical], (str, int)):
+                    conflicts.update({s: body[s] for s in present if str(body[s]) != str(body[canonical])})
                 continue
 
             if present:
@@ -794,7 +801,12 @@ class Runtime:
         for message in data.get("messages", []):
             entry = {"channel": channel.label, "seq": message["seq"], "at": message["at"], "verified": message["verified"], "from_key": message["from"], "sender": self.name_for_key(message["from"]) or ("unknown key" if message["from"] else "unsigned"), "sha256": message["sha256"], "replay": message["sha256"] in channel.seen}
             channel.seen.add(message["sha256"])
-            body, meta = self._open(message)
+            try:
+                body, meta = self._open(message)
+            except Exception as error:
+                # Whatever went wrong belongs to this message alone. Losing the
+                # rest of the batch to it would be the expensive mistake.
+                body, meta = {"text": message.get("body")}, {"signed": bool(message.get("from")), "encrypted": False, "format": "undecodable", "error": error.__class__.__name__}
             entry["body"] = body
             entry.update(meta)
             if isinstance(entry["body"], dict) and isinstance(entry["body"].get("reply_to"), str) and message["from"]:
