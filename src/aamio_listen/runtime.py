@@ -357,7 +357,14 @@ class Runtime:
     def board_post(self, kind, title, text, tags=None, ttl=600, lang=None, deadline=None):
         """Put a need or an offer on the board. The reply inbox is opened for you."""
         channel = self.ensure_board_inbox(int(ttl))
-        fields = {"kind": kind, "title": title, "text": text, "w": channel.w, "ttl": int(ttl)}
+        # The board refuses a post that would outlive the inbox behind it, so
+        # that an address on the board is always an address that still works.
+        # At the top of the range the inbox cannot be opened for longer than
+        # the post asked for, so the post gives way, not the promise.
+        life = min(int(ttl), int(channel.expire_at - time.time()))
+        if life < int(ttl):
+            self.log("board post shortened to %ds to stay inside the inbox" % life)
+        fields = {"kind": kind, "title": title, "text": text, "w": channel.w, "ttl": life}
         if tags:
             fields["tags"] = list(tags)[:8]
         if lang:
