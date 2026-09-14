@@ -4,7 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aamio-listen"
-version = "0.3.3"
+# One literal, in aamio_listen/__init__.py. The two drifted: the package was
+# published as 0.3.3 while `aamio-listen --version` said 0.3.0, so a user
+# reporting a version was reporting the wrong one.
+dynamic = ["version"]
 description = "Local runtime for aamio: keys, inbox, presence, end-to-end encryption, signing, listening, receipts and the open board of needs and offers. An MCP server and a command line."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,6 +22,9 @@ Reference = "https://aamio.at/api.md"
 
 [project.scripts]
 aamio-listen = "aamio_listen.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "aamio_listen.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]

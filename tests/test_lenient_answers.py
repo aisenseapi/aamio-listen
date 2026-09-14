@@ -202,3 +202,32 @@ def test_the_board_default_is_one_value_in_one_place():
     assert runtime_module.BOARD_TTL == 1800
     # The signature reads the constant, so there is no second copy to drift.
     assert inspect.signature(Runtime.board_post).parameters["ttl"].default == runtime_module.BOARD_TTL
+
+
+def test_two_spellings_of_the_same_value_are_not_a_disagreement():
+    # A sender that writes both reply and message, with the same sentence in
+    # each, has not contradicted itself. Reporting it as a conflict asks the
+    # caller to weigh something that is not there.
+    body, meta = Runtime._canonical({"post": "p1", "reply": "on my way", "message": "on my way"})
+    assert body["text"] == "on my way"
+    assert meta["renamed"] == {"reply": "text"}
+    assert "conflicting_fields" not in meta
+
+
+def test_two_spellings_that_actually_differ_still_are():
+    body, meta = Runtime._canonical({"post": "p1", "reply": "on my way", "message": "cannot make it"})
+    assert body["text"] == "on my way"
+    assert meta["conflicting_fields"] == {"message": "cannot make it"}
+
+
+def test_the_version_is_one_literal():
+    # pyproject said 0.3.3 while the module said 0.3.0, so `aamio-listen
+    # --version` reported a version that was never published. pyproject now
+    # reads this attribute, and nothing else carries a number.
+    import pathlib
+    import aamio_listen
+
+    text = (pathlib.Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'version = { attr = "aamio_listen.__version__" }' in text
+    assert not any(line.startswith('version = "') for line in text.splitlines())
+    assert aamio_listen.__version__.count(".") == 2

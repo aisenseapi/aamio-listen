@@ -221,8 +221,20 @@ class Runtime:
     def archive(self, label, record):
         if not self.archive_enabled:
             return
+        # ensure_ascii=False so ordinary non-English text stays readable in the
+        # file. Some text cannot be written that way at all: JSON can carry a
+        # lone surrogate, Python will happily parse it into a str, and UTF-8
+        # cannot encode it. It arrives as plain ASCII on the wire, so it is the
+        # sender who decides which of the two kinds of text this is. That one
+        # record gets escaped instead, which loses nothing and keeps every other
+        # record readable.
+        line = json.dumps(record, ensure_ascii=False)
+        try:
+            line.encode("utf-8")
+        except UnicodeEncodeError:
+            line = json.dumps(record, ensure_ascii=True)
         with open(os.path.join(self.home, "archive", "%s.jsonl" % label), "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.write(line + "\n")
 
     # ---------------------------------------------------------- partners --
 
@@ -741,7 +753,10 @@ class Runtime:
             if present:
                 body[canonical] = body[present[0]]
                 renamed[present[0]] = canonical
-                conflicts.update({s: body[s] for s in present[1:]})
+                # Two spellings carrying the same value are not a
+                # disagreement. Reporting them as one asks a caller to weigh a
+                # conflict that is not there.
+                conflicts.update({s: body[s] for s in present[1:] if str(body[s]) != str(body[present[0]])})
 
         meta = {}
 
@@ -815,12 +830,30 @@ class Runtime:
             entries.append(entry)
             with channel.lock:
                 channel.received.append(entry)
-            self.archive(channel.label, dict(entry, kind="received"))
+            # Received, readable, archived and handled are four different
+            # things, and a failure at one must not be reported as the others.
+            # The message above is delivered already; whether it also reached
+            # the file on disk is recorded here, and is never allowed to cost
+            # the rest of the batch, which is what a full disk would otherwise
+            # do. Nor is it swallowed: it stays on the entry and in the log,
+            # because a storage failure is worth knowing about.
+            try:
+                self.archive(channel.label, dict(entry, kind="received"))
+                entry["archived"] = True
+            except Exception as error:
+                entry["archived"] = False
+                entry["archive_error"] = "%s: %s" % (error.__class__.__name__, error)
+                self.log("archive %s seq %s: %s" % (channel.label, entry["seq"], error))
         if entries:
             # The cursor moves and the hashes are stored in the same save, and
             # that save happens before the caller sees a single message. A
             # crash after this point redelivers nothing; a crash before it
             # redelivers everything, and the stored hashes mark those replays.
+            #
+            # It moves past a message the archive refused as well. The archive
+            # is a record of what was delivered, not the delivery itself:
+            # holding the cursor back would re-read that message forever while
+            # the disk stayed full, and redeliver everything after it.
             channel.after = max(channel.after, entries[-1]["seq"])
             self.save_state()
         return "ok", entries
