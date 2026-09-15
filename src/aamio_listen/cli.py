@@ -153,7 +153,9 @@ def main(argv=None):
         elif args.board_command == "replies":
             if args.wait:
                 runtime.read(args.wait)
-            out({"replies": runtime.board_replies(args.post)})
+            # The address comes with the answers. An empty list means one of
+            # two very different things, and only this tells them apart.
+            out({"replies": runtime.board_replies(args.post), "reply_address": runtime.board_reply_address()})
         elif args.board_command == "withdraw":
             out(runtime.board_withdraw(args.post))
         else:

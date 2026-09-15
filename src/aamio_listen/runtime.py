@@ -26,6 +26,10 @@ INBOX_TTL = 3600
 # lifetime whether the field is sent or left out. The board decides; this is a
 # copy, and it is the only copy in this client.
 BOARD_TTL = 1800
+# How much longer than the post itself a reply address should live. The poster
+# reads answers on their own schedule, and a minute either way is the
+# difference between a conversation and a dead end.
+ANSWER_MARGIN = 600
 PRESENCE_TTL = 120
 PRESENCE_REFRESH = 60
 RENEW_BEFORE = 180
@@ -497,8 +501,27 @@ class Runtime:
             post = self.board_get(post)
             if post is None:
                 raise LookupError("no live post with that id")
-        channel = self.ensure_board_inbox()
+        # The address on this answer has to outlive the post it answers.
+        #
+        # It did not. ensure_board_inbox() defaults to 900, which opens a
+        # sixteen minute inbox, and a board post lives up to sixty. Measured in
+        # the wild: an answer went out at 13:11:39 with a return address that
+        # died at 13:27:39, and the poster's agent read it at 13:35:35 and
+        # could not write back. Everything worked; the door had simply closed.
+        #
+        # The service already refuses a *post* whose reply address is shorter
+        # than the post -- "a post whose address is dead reaches nobody" -- and
+        # we were breaking the same rule in the other direction, in our own
+        # client, with nothing checking it.
+        remaining = max(0, int(post.get("expire_at") or 0) - int(time.time()))
+        channel = self.ensure_board_inbox(remaining + ANSWER_MARGIN)
         own_post = post.get("key") == self.keys.public
+
+        if channel.expire_at < (post.get("expire_at") or 0):
+            self.log(
+                "your reply address expires %d s before the post does, so an answer that arrives late "
+                "cannot be answered back" % ((post.get("expire_at") or 0) - channel.expire_at)
+            )
         if own_post:
             self.log("this post is signed by your own key, so the answer is sealed to you and nobody else will read it")
         with self.lock:
@@ -520,24 +543,106 @@ class Runtime:
         return answer
 
     def board_replies(self, post_id=None):
-        """Answers received on the board inbox, decrypted and verified, newest last."""
+        """Answers received on the board inbox, decrypted and verified, newest last.
+
+        Reads the archive as well as this process's memory. `received` lives in
+        the process that polled, and the command line is one process per call,
+        so a run of `board replies` used to show only what arrived inside its
+        own wait -- everything from before was past the cursor and invisible,
+        though it was on disk the whole time. That is how a real answer went
+        unread and the silence got blamed on the sender.
+        """
         out = []
-        for label, channel in list(self.channels.items()):
-            on_the_board = label.startswith("board")
+        seen = set()
+
+        def wanted(entry):
+            body = entry.get("body")
+
+            if not isinstance(body, dict):
+                return False
+
+            # Without a post id this is an ordinary message on some channel,
+            # not an answer to anything, and a private conversation should not
+            # turn into a list of board replies.
+            if post_id is None:
+                return isinstance(body.get("post"), str)
+
+            return body.get("post") == post_id
+
+        # Every channel, not only the ones named board: an answer can arrive on
+        # a private channel opened for the conversation, and scoping this to
+        # "board" once hid exactly those. That is a separate fix and it stays.
+        for channel in list(self.channels.values()):
             with channel.lock:
                 for entry in channel.received:
-                    body = entry.get("body")
-                    if not isinstance(body, dict):
-                        continue
-                    if post_id is not None:
-                        if body.get("post") == post_id:
-                            out.append(entry)
-                    elif on_the_board or "post" in body:
-                        # Everything on the board inbox, and elsewhere only
-                        # what names a post, so a private thread does not turn
-                        # into a list of board answers.
+                    if wanted(entry):
+                        seen.add(entry.get("sha256"))
                         out.append(entry)
-        return sorted(out, key=lambda e: e["at"])
+
+        for label in sorted(set(self.channels) | {"board"}):
+            for entry in self._archived(label, "received"):
+                if wanted(entry) and entry.get("sha256") not in seen:
+                    seen.add(entry.get("sha256"))
+                    out.append(dict(entry, from_archive=True))
+
+        out.sort(key=lambda e: (e.get("at") or 0, e.get("seq") or 0))
+
+        return out
+
+    def _archived(self, label, kind):
+        """Entries this client wrote down for a channel, oldest first. Silent
+        when archiving is off or the file is not there: an empty archive is not
+        an error, it is a client that was told not to keep one."""
+        home = getattr(self, "home", None)
+
+        if not home or not getattr(self, "archive_enabled", False):
+            return []
+
+        path = os.path.join(home, "archive", "%s.jsonl" % label)
+
+        if not os.path.isfile(path):
+            return []
+
+        found = []
+
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+
+                if isinstance(record, dict) and record.get("kind") == kind:
+                    found.append(record)
+
+        return found
+
+    def board_reply_address(self):
+        """Where answers to our answers would arrive, and whether it is still
+        open. A board inbox that has expired is the difference between "nobody
+        replied" and "nobody could"."""
+        channel = self.channels.get("board")
+
+        if channel is None:
+            return {"w": None, "open": False, "why": "No board inbox on this machine. One is opened when you answer or post."}
+
+        left = int(channel.expire_at - time.time())
+
+        if left > 0:
+            return {"w": channel.w, "open": True, "expires_at": int(channel.expire_at), "seconds_left": left}
+
+        return {
+            "w": channel.w,
+            "open": False,
+            "expires_at": int(channel.expire_at),
+            "why": "The address you answered from closed %d s ago. Anything sent to it after that was refused at the door, "
+                   "so an empty result here does not mean nobody wrote back." % -left,
+        }
 
     def open_channel_with(self, key, ttl=900, label=None, reply_to=None, note=None):
         """A private channel only that key may write to, with its address handed over.
