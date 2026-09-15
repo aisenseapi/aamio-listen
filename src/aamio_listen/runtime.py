@@ -942,14 +942,34 @@ class Runtime:
         status, data = self.client.receipt(channel.w, channel.read_key)
         if status != 200:
             raise RuntimeError("receipt failed: %s %s" % (status, data))
+        # Two different checks, and they used to be reported as one.
+        #
+        # The receipt's own arithmetic can always be checked: hash the lines it
+        # itself lists and see whether that is the root it claims. That catches
+        # a receipt that does not add up, and it needs nothing from us.
+        #
+        # Whether it agrees with what we saw is a stronger claim, and one we
+        # can only make when we hold every message it counts. `received` lives
+        # in this process and nowhere else, so a one-shot `aamio-listen
+        # receipt` holds none of them and the old field said False: a good
+        # receipt reported as a mismatch, which is the one thing a proof must
+        # never do. It says None now, with the count, so "not compared" cannot
+        # be read as "did not match".
         with channel.lock:
             entries = sorted(channel.received, key=lambda e: e["seq"])
-        lines = "".join("%d\t%d\t%s\t%s\n" % (e["seq"], e["at"], e["sha256"], e["from_key"] or "-") for e in entries)
-        local_root = sha256hex(lines)
+        held = len(entries)
+        line = "%d\t%d\t%s\t%s\n"
+        listed = "".join(line % (m["seq"], m["at"], m["sha256"], m.get("from") or "-") for m in (data.get("messages") or []))
+        ours = "".join(line % (e["seq"], e["at"], e["sha256"], e["from_key"] or "-") for e in entries)
+        comparable = held == data["count"]
         # Sign what we took, so partners can exchange receipts and compare
         # without trusting the network's word alone.
         attestation = "aamio-receipt-v1\n%s\n%s\n%d\n%d" % (channel.w, data["root"], data["count"], data.get("issued_at", 0))
-        result = {"label": label, "w": channel.w, "root": data["root"], "commitment": data.get("commitment"), "count": data["count"], "keys": [self.name_for_key(k) or k for k in data.get("keys", [])], "local_root_matches": local_root == data["root"], "signed_by": self.keys.public, "signature": self.keys.sign(attestation), "signed_text": attestation, "receipt": data}
+        result = {"label": label, "w": channel.w, "root": data["root"], "commitment": data.get("commitment"), "count": data["count"], "keys": [self.name_for_key(k) or k for k in data.get("keys", [])], "root_adds_up": sha256hex(listed) == data["root"], "held_locally": held, "local_root_matches": (sha256hex(ours) == data["root"]) if comparable else None, "signed_by": self.keys.public, "signature": self.keys.sign(attestation), "signed_text": attestation, "receipt": data}
+
+        if not comparable:
+            result["local_check"] = ("Not compared: this process holds %d of the %d messages the receipt counts, so a local root would differ for a reason that is not the receipt's. "
+                "The receipt stands on root_adds_up and the signature. For the independent check, take the receipt in the process that read the messages." % (held, data["count"]))
         if anchor:
             idem = sha256hex("aamio-listen:%s:%s" % (self.keys.hash, data["root"]))[:32]
             status, proof = self.client.anchor(data["root"], idem)
