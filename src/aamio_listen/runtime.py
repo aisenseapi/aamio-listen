@@ -814,7 +814,14 @@ class Runtime:
             return "error", []
         entries = []
         for message in data.get("messages", []):
-            entry = {"channel": channel.label, "seq": message["seq"], "at": message["at"], "verified": message["verified"], "from_key": message["from"], "sender": self.name_for_key(message["from"]) or ("unknown key" if message["from"] else "unsigned"), "sha256": message["sha256"], "replay": message["sha256"] in channel.seen}
+            # sender is a name when we know the key and a label when we do
+            # not, which reads well and answers the wrong question. Whether a
+            # signature checked out, which key made it, and whether that key is
+            # someone we have met are three separate facts, and a reader has to
+            # be able to act on each: a verified stranger is not a contact, and
+            # a contact can still send something not to be trusted.
+            known = self.name_for_key(message["from"])
+            entry = {"channel": channel.label, "seq": message["seq"], "at": message["at"], "verified": message["verified"], "from_key": message["from"], "known_contact": known is not None, "sender": known or ("unknown key" if message["from"] else "unsigned"), "sha256": message["sha256"], "replay": message["sha256"] in channel.seen}
             channel.seen.add(message["sha256"])
             try:
                 body, meta = self._open(message)

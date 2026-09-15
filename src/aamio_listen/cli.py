@@ -130,7 +130,7 @@ def main(argv=None):
         data = json.loads(args.data) if args.data else None
         out(runtime.send(args.to, args.text, data))
     elif args.command == "read":
-        out({"messages": [{k: v for k, v in m.items() if k != "from_key"} for m in runtime.read(args.wait)]})
+        out({"messages": runtime.read(args.wait)})
     elif args.command == "receipt":
         out(runtime.receipt(args.channel, args.anchor))
     elif args.command == "channel":
