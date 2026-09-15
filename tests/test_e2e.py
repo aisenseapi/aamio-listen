@@ -13,8 +13,8 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from aamio_listen.crypto import Keys, is_envelope, key_hash  # noqa: E402
-from aamio_listen.runtime import Runtime  # noqa: E402
+from aamio.crypto import Keys, is_envelope, key_hash  # noqa: E402
+from aamio.runtime import Runtime  # noqa: E402
 
 
 def test_crypto_roundtrip():

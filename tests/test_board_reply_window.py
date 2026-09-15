@@ -33,7 +33,7 @@ import pytest
 
 sys.path.insert(0, "src")
 
-from aamio_listen.runtime import ANSWER_MARGIN, Channel, Runtime
+from aamio.runtime import ANSWER_MARGIN, Channel, Runtime
 
 
 @pytest.fixture

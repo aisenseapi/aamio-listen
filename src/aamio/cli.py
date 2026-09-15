@@ -1,15 +1,17 @@
-"""Command line for aamio-listen.
+"""Command line for aamio.
 
-    aamio-listen init [--tags a,b]        make a key and an inbox, print your identity
-    aamio-listen whoami                   your key, hash prefix and inbox
-    aamio-listen partner add NAME KEY     add a partner from the contract
-    aamio-listen partner list
-    aamio-listen partner remove NAME
-    aamio-listen lookup [NAME ...]        who is online now
-    aamio-listen send NAME TEXT           encrypt, sign, send
-    aamio-listen read [--wait 25]         read new messages
-    aamio-listen receipt [--channel inbox] [--anchor]
-    aamio-listen serve                    MCP server on stdio
+    aamio init [--tags a,b]        make a key and an inbox, print your identity
+    aamio whoami                   your key, hash prefix and inbox
+    aamio partner add NAME KEY     add a partner from the contract
+    aamio partner list
+    aamio partner remove NAME
+    aamio lookup [NAME ...]        who is online now
+    aamio send NAME TEXT           encrypt, sign, send
+    aamio read [--wait 25]         read new messages
+    aamio receipt [--channel inbox] [--anchor]
+    aamio serve                    MCP server on stdio
+
+The command is also installed as aamio-listen, which is what it used to be called.
 
 Environment: AAMIO_HOME (default ~/.aamio), AAMIO_HOST (default https://aamio.at), AAMIO_TAGS.
 """
@@ -27,11 +29,11 @@ def out(value):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="aamio-listen", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(prog="aamio", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--home", default=None)
     parser.add_argument("--host", default=None)
     parser.add_argument("--no-archive", action="store_true", help="do not keep decrypted messages and receipts locally")
-    parser.add_argument("--version", action="version", version="aamio-listen " + __version__)
+    parser.add_argument("--version", action="version", version="aamio " + __version__)
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("init")

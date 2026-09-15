@@ -25,8 +25,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, "src")
 
-from aamio_listen.crypto import Keys, sha256hex
-from aamio_listen.runtime import Channel, Runtime
+from aamio.crypto import Keys, sha256hex
+from aamio.runtime import Channel, Runtime
 
 MESSAGES = [
     {"seq": 1, "at": 1700000001, "sha256": "a" * 64, "from": "sender-key"},

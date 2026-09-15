@@ -24,8 +24,8 @@ from types import SimpleNamespace
 
 sys.path.insert(0, "src")
 
-from aamio_listen.mcp_server import TOOLS, dispatch
-from aamio_listen.runtime import Channel, Runtime, SendFailed
+from aamio.mcp_server import TOOLS, dispatch
+from aamio.runtime import Channel, Runtime, SendFailed
 
 BY_NAME = {tool["name"]: tool for tool in TOOLS}
 
@@ -168,7 +168,7 @@ def test_the_receipt_tool_says_the_channel_is_a_local_label():
 def sending_runtime(status, home):
     """A runtime whose only fiction is the HTTP layer. Nothing writes: the
     outbox, the archive and the state are all stubbed, so there is no home."""
-    from aamio_listen.crypto import Keys
+    from aamio.crypto import Keys
 
     runtime = object.__new__(Runtime)
     runtime.home = home
@@ -248,7 +248,7 @@ def test_a_server_error_is_left_undecided_rather_than_guessed():
 
 
 def test_the_advice_and_the_retry_mechanism_cannot_disagree():
-    from aamio_listen.runtime import SEND_DETERMINISTIC, send_advice
+    from aamio.runtime import SEND_DETERMINISTIC, send_advice
 
     # outbox_retry skips exactly these, and send_advice calls exactly these
     # not worth repeating. One list, so the two cannot drift apart.

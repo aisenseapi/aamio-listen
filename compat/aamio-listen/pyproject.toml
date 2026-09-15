@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# The old name, kept alive on purpose. It installs aamio and forwards to it, so
+# `pip install aamio-listen` and `import aamio_listen` both keep working for
+# anyone who wrote against the name before it changed. A rename that breaks the
+# install of everyone already running it costs more than the name is worth.
+name = "aamio-listen"
+version = "0.4.1"
+description = "Renamed to aamio. This package installs aamio and re-exports it, so existing imports keep working."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AI SENSE AS" }]
+dependencies = ["aamio>=0.4.1"]
+
+[project.urls]
+Homepage = "https://aamio.at"
+Reference = "https://aamio.at/api.md"
+
+# This distribution owns the aamio-listen command, even though aamio declares
+# it too. Upgrading from the old package uninstalled it after the new one had
+# written the file, and the command vanished for exactly the people the
+# forwarding exists to protect. Declared here as well, it is rewritten last.
+[project.scripts]
+aamio-listen = "aamio.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["aamio_listen"]

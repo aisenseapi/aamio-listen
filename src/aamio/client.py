@@ -11,6 +11,7 @@ import string
 import urllib.error
 import urllib.request
 
+from . import __version__
 from .crypto import b64url, sha256hex
 
 DEFAULT_HOST = "https://aamio.at"
@@ -43,7 +44,12 @@ class AamioClient:
             data = body.encode("utf-8") if isinstance(body, str) else json.dumps(body).encode("utf-8")
         request = urllib.request.Request(url, data=data, method=method)
         request.add_header("Accept", "application/json")
-        request.add_header("User-Agent", "aamio-listen/0.1")
+        # The version, not a constant that looks like one. This said
+        # aamio-listen/0.1 from the first commit through every release after
+        # it, so an access log full of "0.1" was read as somebody running five
+        # versions behind when it was only ever this line. An operator who
+        # cannot tell versions apart from the wire cannot tell anything apart.
+        request.add_header("User-Agent", "aamio/" + __version__)
         if data is not None and "Content-Type" not in (headers or {}):
             request.add_header("Content-Type", "application/json")
         for name, value in (headers or {}).items():

@@ -187,7 +187,7 @@ class Runtime:
         real = os.path.realpath(self.home)
 
         if real in _LOCKED_HOMES:
-            raise RuntimeError("another aamio-listen in this process is already using %s" % self.home)
+            raise RuntimeError("another aamio in this process is already using %s" % self.home)
 
         held = self._load_json("lock", None)
 
@@ -202,7 +202,7 @@ class Runtime:
 
             if alive:
                 raise RuntimeError(
-                    "another aamio-listen (pid %s) is using %s. Stop it, or use a different AAMIO_HOME." % (held["pid"], self.home)
+                    "another aamio (pid %s) is using %s. Stop it, or use a different AAMIO_HOME." % (held["pid"], self.home)
                 )
 
         self._save_json("lock", {"pid": os.getpid(), "at": int(time.time()), "host": self.host})

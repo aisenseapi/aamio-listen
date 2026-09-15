@@ -26,7 +26,7 @@ import pytest
 
 sys.path.insert(0, "src")
 
-from aamio_listen.runtime import Channel, Runtime
+from aamio.runtime import Channel, Runtime
 
 
 @pytest.fixture

@@ -21,8 +21,8 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from aamio_listen.crypto import thread_signing_input  # noqa: E402
-from aamio_listen.runtime import Runtime, SendFailed  # noqa: E402
+from aamio.crypto import thread_signing_input  # noqa: E402
+from aamio.runtime import Runtime, SendFailed  # noqa: E402
 
 
 def shut(*runtimes):

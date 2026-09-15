@@ -13,7 +13,7 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from aamio_listen import mcp_server
+from aamio import mcp_server
 
 
 def tool(name):

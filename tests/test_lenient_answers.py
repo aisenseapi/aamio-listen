@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, "src")
 
-from aamio_listen.runtime import Channel, Runtime
+from aamio.runtime import Channel, Runtime
 
 CANONICAL = {"post": "p1", "reply_to": "r" * 20, "text": "use a 5 minute debounce"}
 GUESSED = {"post_id": "p1", "w": "r" * 20, "reply": "use a 5 minute debounce"}
@@ -197,7 +197,7 @@ def test_a_field_holding_an_object_is_not_compared_to_a_string():
 
 
 def test_the_board_default_is_one_value_in_one_place():
-    import aamio_listen.runtime as runtime_module
+    import aamio.runtime as runtime_module
     import inspect
     assert runtime_module.BOARD_TTL == 1800
     # The signature reads the constant, so there is no second copy to drift.
@@ -225,9 +225,38 @@ def test_the_version_is_one_literal():
     # --version` reported a version that was never published. pyproject now
     # reads this attribute, and nothing else carries a number.
     import pathlib
-    import aamio_listen
+    import aamio
 
     text = (pathlib.Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'version = { attr = "aamio_listen.__version__" }' in text
+    assert 'version = { attr = "aamio.__version__" }' in text
     assert not any(line.startswith('version = "') for line in text.splitlines())
-    assert aamio_listen.__version__.count(".") == 2
+    assert aamio.__version__.count(".") == 2
+
+
+def test_the_user_agent_says_which_version_it_is():
+    # It said aamio-listen/0.1 from the first commit through every release
+    # after it, so an access log full of "0.1" was read as somebody running an
+    # old client when it was only ever this constant. A wire that cannot tell
+    # versions apart makes an operator confidently wrong, and it did.
+    import urllib.request
+
+    import aamio
+    from aamio.client import AamioClient
+
+    seen = {}
+    real = urllib.request.urlopen
+
+    def capture(request, timeout=None):
+        seen["ua"] = request.get_header("User-agent")
+        raise OSError("no network in a test")
+
+    urllib.request.urlopen = capture
+
+    try:
+        status, body = AamioClient().http("GET", "https://aamio.test/health")
+    finally:
+        urllib.request.urlopen = real
+
+    assert status == 0, "the probe should never reach a network"
+    assert seen["ua"] == "aamio/" + aamio.__version__
+    assert not seen["ua"].endswith("/0.1")
