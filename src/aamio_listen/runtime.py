@@ -40,6 +40,59 @@ def home_dir() -> str:
 _LOCKED_HOMES = set()
 
 
+# What an HTTP status says about sending the same bytes again.
+#
+# outbox_retry already had to know this and carried its own list inline. The
+# MCP error handler then grew a second answer that disagreed with it: every
+# refusal became "change the request", including 429, which is a rate window
+# and needs no change at all. Two places knowing the same thing differently is
+# how advice ends up contradicting the mechanism meant to act on it.
+#
+# Deterministic: the same bytes will be refused again, so repeating is waste.
+# Later: nothing about the message is wrong, only the moment.
+# Anything else answered by the server is left undecided on purpose. It told us
+# it failed, but not whether it had already stored the message.
+SEND_DETERMINISTIC = (400, 403, 410, 413, 415, 422, 501)
+SEND_TRY_LATER = (429, 503)
+
+
+def send_advice(outcome, status):
+    """(retryable, fix) for one send outcome. retryable is about the same
+    stored bytes, and is never a permission to repeat something automatically.
+
+    False  the same message will fail the same way
+    True   the message is fine; the moment was not
+    None   it cannot be decided from what we know
+    """
+    if outcome == "unknown":
+        return None, (
+            "No answer came back, so this message may already have been delivered. Keep its message_id. "
+            "aamio_pending lists what has no settled outcome on this machine; it does not confirm delivery, "
+            "and nothing here can, because the address it went to is not yours to read. This interface has no "
+            "retry-by-id tool: do not pass the message_id to aamio_send and do not compose a replacement. "
+            "An approved retry sends the stored bytes again through the runtime's own outbox retry."
+        )
+
+    if status in SEND_TRY_LATER:
+        return True, (
+            "aamio declined this for now, not because of the message: %d is a rate window or a busy service. "
+            "Do not change the content. Wait, then send the stored message again through the runtime's outbox "
+            "retry rather than composing a new one." % status
+        )
+
+    if status in SEND_DETERMINISTIC:
+        return False, (
+            "aamio refused this and will refuse the same bytes again. Read the error, correct the request, and "
+            "send the corrected one as a new message."
+        )
+
+    return None, (
+        "aamio answered %s, which this client does not classify. It may or may not have stored the message "
+        "before failing, so treat delivery as unsettled: keep the message_id, read the error, and do not "
+        "resend blindly." % status
+    )
+
+
 class SendFailed(RuntimeError):
     """A send that did not end in a stored message.
 
@@ -664,7 +717,7 @@ class Runtime:
                 continue
             if entry["status"] not in ("unknown", "refused"):
                 continue
-            if entry["status"] == "refused" and entry.get("last_status") in (403, 410, 413, 415):
+            if entry["status"] == "refused" and entry.get("last_status") in SEND_DETERMINISTIC:
                 continue
             status, _ = self._deliver(entry)
             out.append({"id": entry["id"], "w": entry["w"], "status": entry["status"], "http": status})

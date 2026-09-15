@@ -12,7 +12,7 @@ import sys
 import time
 
 from . import __version__
-from .runtime import Runtime, SendFailed, BOARD_TTL
+from .runtime import Runtime, SendFailed, send_advice, BOARD_TTL
 
 SUPPORTED = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"]
 
@@ -113,6 +113,19 @@ def dispatch(runtime: Runtime, name: str, arguments: dict):
     # about that message afterwards, and the obvious move was to send again.
     # Refused and unknown want opposite reactions, and unknown is not failure.
     except SendFailed as error:
+        # A send that did not store a message knows more than its sentence
+        # does: which message it was, whether aamio refused it or never
+        # answered, and the status. Flattened to str(error) those became prose,
+        # and the message id was not even in the prose.
+        #
+        # The advice comes from runtime.send_advice so it cannot disagree with
+        # outbox_retry, which is the thing that would carry out a retry. The
+        # first version of this said "change the request" for every refusal,
+        # including 429 -- a rate window, where the message is fine and only
+        # the moment was wrong -- and told the model to read the thread and
+        # resend by id, neither of which it can do from here.
+        retryable, fix = send_advice(error.outcome, error.status)
+
         return result_of({
             "error": str(error),
             "error_code": "send_" + error.outcome,
@@ -120,18 +133,8 @@ def dispatch(runtime: Runtime, name: str, arguments: dict):
             "outcome": error.outcome,
             "message_id": error.message_id,
             "status": error.status,
-            # False means the same request will be refused again; None means
-            # it cannot be decided from this outcome alone. Written out,
-            # because `x == "refused" and None or False` collapses both to
-            # False and reads as if it did not.
-            "retryable": False if error.outcome == "refused" else None,
-            "fix": (
-                "aamio refused this message. Read the reason, change the request, and send the corrected one."
-                if error.outcome == "refused" else
-                "No answer came back, so this message may have been delivered. Do not send it again yet: "
-                "call aamio_pending to see what has no confirmed outcome, and read the thread to find out. "
-                "If you do resend, resend this message_id rather than making a new one."
-            ),
+            "retryable": retryable,
+            "fix": fix,
         }, True)
     except (ValueError, LookupError, RuntimeError, KeyError) as error:
         return result_of({"error": str(error)}, True)

@@ -157,3 +157,103 @@ def test_the_receipt_tool_says_the_channel_is_a_local_label():
     # The default is inbox, which is rarely the channel a board answer is on.
     assert "local channel label" in description
     assert "aamio_channels" in description
+
+
+# --------------------------------------------------------------------------
+# The advice on a failed send, driven through the real send -> _deliver ->
+# dispatch path rather than a hand-built exception, because the classification
+# that was wrong lives in _deliver and a constructed SendFailed would skip it.
+
+
+def sending_runtime(status, home):
+    """A runtime whose only fiction is the HTTP layer. Nothing writes: the
+    outbox, the archive and the state are all stubbed, so there is no home."""
+    from aamio_listen.crypto import Keys
+
+    runtime = object.__new__(Runtime)
+    runtime.home = home
+    runtime.host = "https://aamio.test"
+    runtime.lock = threading.RLock()
+    runtime.keys = Keys.generate()
+    runtime.partners = []
+    runtime.peers = {}
+    runtime.outbox = {}
+    runtime.tags = []
+    runtime.archive_enabled = False
+    runtime.archive = lambda label, record: None
+    runtime.save_outbox = lambda: None
+    runtime.save_state = lambda: None
+    runtime.log = lambda text: None
+    runtime.name_for_key = lambda key: None
+    runtime.presence_at = 9e18
+    inbox = Channel("inbox", "read-key", "i" * 20, 9e18)
+    runtime.channels = {"inbox": inbox}
+    runtime.ensure_inbox = lambda: inbox
+
+    recipient = Keys.generate()
+    address = "w" * 20
+    runtime.peers[address] = recipient.public
+    runtime.client = SimpleNamespace(
+        post=lambda w, envelope, key, signature: (status, {"error": "as the server said"} if status else None)
+    )
+
+    return runtime, address
+
+
+def send_through(status):
+    runtime, address = sending_runtime(status, "unused")
+
+    return dispatch(runtime, "aamio_send", {"to": address, "text": "hello"})["structuredContent"]
+
+
+def test_a_rate_window_is_not_a_reason_to_change_the_message():
+    out = send_through(429)
+
+    assert out["outcome"] == "refused"
+    assert out["status"] == 429
+    # The message is fine. Saying "change the request" here contradicts the
+    # client's own outbox_retry, which will happily resend these bytes.
+    assert out["retryable"] is True
+    assert "not because of the message" in out["fix"]
+    assert "Do not change the content" in out["fix"]
+
+
+def test_a_message_too_large_will_not_get_smaller_by_repeating():
+    out = send_through(413)
+
+    assert out["retryable"] is False
+    assert "will refuse the same bytes again" in out["fix"]
+
+
+def test_no_answer_keeps_the_uncertainty_and_the_id():
+    out = send_through(0)
+
+    assert out["outcome"] == "unknown"
+    assert out["retryable"] is None
+    assert out["message_id"]
+    # Two things the advice must not tell a model to do from here: read the
+    # recipient's thread, which needs their read key, and retry by id through
+    # aamio_send, which takes no id.
+    assert "not yours to read" in out["fix"]
+    assert "no retry-by-id tool" in out["fix"]
+
+
+def test_a_server_error_is_left_undecided_rather_than_guessed():
+    out = send_through(500)
+
+    # It answered, so it is not "unknown" in the no-reply sense; but whether it
+    # stored the message before failing is not something this side knows.
+    assert out["retryable"] is None
+    assert "unsettled" in out["fix"]
+
+
+def test_the_advice_and_the_retry_mechanism_cannot_disagree():
+    from aamio_listen.runtime import SEND_DETERMINISTIC, send_advice
+
+    # outbox_retry skips exactly these, and send_advice calls exactly these
+    # not worth repeating. One list, so the two cannot drift apart.
+    for status in SEND_DETERMINISTIC:
+        assert send_advice("refused", status)[0] is False, status
+
+    for status in (429, 503):
+        assert send_advice("refused", status)[0] is True, status
