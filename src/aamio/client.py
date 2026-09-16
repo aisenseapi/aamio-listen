@@ -83,8 +83,16 @@ class AamioClient:
         status, data = self.call("PUT", "/" + w, None, headers)
         return status, data, read_key, w
 
-    def post(self, w: str, body_text: str, key: str, signature: str, content_type: str = "text/plain"):
-        return self.call("POST", "/" + w, body_text, {"Content-Type": content_type, "X-Key": key, "X-Sig": signature})
+    def post(self, w: str, body_text: str, key: str, signature: str, content_type: str = "text/plain", work: str = None):
+        headers = {"Content-Type": content_type, "X-Key": key, "X-Sig": signature}
+        # Proof of work, only for an inbox whose gate asks for it.
+        if work is not None:
+            headers["X-Work"] = work
+        return self.call("POST", "/" + w, body_text, headers)
+
+    def gate(self, w: str):
+        """GET /{w}/gate: what an inbox asks of whoever writes to it. No key needed."""
+        return self.call("GET", "/%s/gate" % w)
 
     def read(self, w: str, read_key: str, after: int = 0, wait: int = 0):
         path = "/%s/after/%d" % (w, int(after))

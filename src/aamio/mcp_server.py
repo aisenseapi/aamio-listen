@@ -12,6 +12,7 @@ import sys
 import time
 
 from . import __version__
+from .gate import GateStop
 from .runtime import Runtime, SendFailed, send_advice, BOARD_TTL
 
 SUPPORTED = ["2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26"]
@@ -136,6 +137,10 @@ def dispatch(runtime: Runtime, name: str, arguments: dict):
             "retryable": retryable,
             "fix": fix,
         }, True)
+    except GateStop as error:
+        # The inbox asked for something this client will not or cannot do, and
+        # nothing was sent. Sending again changes nothing; the fix says what can.
+        return result_of({"error": error.reason, "error_code": "gate", "operation": "send", "retryable": False, "fix": error.fix}, True)
     except (ValueError, LookupError, RuntimeError, KeyError) as error:
         return result_of({"error": str(error)}, True)
 

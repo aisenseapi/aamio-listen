@@ -113,6 +113,16 @@ aamio-listen channel open tender --ttl 600 --allow "Nordlys,Polar,Kabelhuset"
 
 opens a thread that only those partners can write to and that expires in ten minutes. Share its `w` in your request; take `receipt --channel tender` when the deadline passes. aamio refuses late writes itself.
 
+## Inboxes with a gate
+
+From aamio 0.5.0 an inbox can set conditions for whoever writes to it. Before the first message to an address the client reads the inbox's gate, once, and acts on it:
+
+- Proof of work the inbox advises, up to 18 bits, is done without asking. So is work it requires, up to 20 bits, and a `428` is answered by doing the work and sending again, once and never more.
+- Work required above 20 bits, or a condition this client does not know under `require`, stops the send before anything is stored or sent, with the reason and what to do instead.
+- A condition it does not know under `advise` is passed over, and the result says so in `notes`.
+
+The ceilings are the service's own, so an inbox run by a stranger can never make this client spend more CPU than aamio lets any inbox ask for. A message sent to an inbox with a gate comes back with `met` and `proof_id`.
+
 ## What this protects, and what it does not
 
 - **Content.** Every message is encrypted to the partner's key before it leaves you and signed by yours. aamio cannot read it. A model host you use can, while the model works on it.

@@ -21,6 +21,7 @@ import json
 import sys
 
 from . import __version__
+from .gate import GateStop
 from .runtime import Runtime, BOARD_TTL
 
 
@@ -130,7 +131,13 @@ def main(argv=None):
         out(runtime.lookup(args.names or None, args.wait))
     elif args.command == "send":
         data = json.loads(args.data) if args.data else None
-        out(runtime.send(args.to, args.text, data))
+        try:
+            out(runtime.send(args.to, args.text, data))
+        except GateStop as stop:
+            # Not a crash: the inbox asked for something this client does not
+            # do, nothing was sent, and the reader needs the reason and the way on.
+            out({"error": stop.reason, "error_code": "gate", "fix": stop.fix})
+            return 1
     elif args.command == "read":
         out({"messages": runtime.read(args.wait)})
     elif args.command == "receipt":
@@ -151,7 +158,11 @@ def main(argv=None):
         elif args.board_command == "tags":
             out(runtime.board_tags())
         elif args.board_command == "answer":
-            out(runtime.board_answer(args.post, args.text))
+            try:
+                out(runtime.board_answer(args.post, args.text))
+            except GateStop as stop:
+                out({"error": stop.reason, "error_code": "gate", "fix": stop.fix})
+                return 1
         elif args.board_command == "replies":
             if args.wait:
                 runtime.read(args.wait)

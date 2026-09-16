@@ -19,6 +19,7 @@ import threading
 import time
 
 from .client import AamioClient, DEFAULT_HOST
+from .gate import GateStop, plan as gate_plan, solve as gate_solve
 from .crypto import Keys, board_delete_signing_input, board_signing_input, is_envelope, is_key, key_hash, presence_signing_input, sha256hex, thread_signing_input, unb64url
 
 INBOX_TTL = 3600
@@ -56,7 +57,7 @@ _LOCKED_HOMES = set()
 # Later: nothing about the message is wrong, only the moment.
 # Anything else answered by the server is left undecided on purpose. It told us
 # it failed, but not whether it had already stored the message.
-SEND_DETERMINISTIC = (400, 403, 410, 413, 415, 422, 501)
+SEND_DETERMINISTIC = (400, 403, 410, 413, 415, 422, 428, 501)
 SEND_TRY_LATER = (429, 503)
 
 
@@ -162,6 +163,7 @@ class Runtime:
                 self.channels[channel.label] = channel
         self.outbox = self._load_json("outbox.json", {})
         self.effects = self._load_json("effects.json", {})
+        self.gates = {}                                       # write address -> the gate it was opened with
         # Anything still pending was in flight when the last process stopped.
         # Whether it reached aamio is unknown, and it stays unknown until
         # somebody looks. Retrying is a decision, not a default.
@@ -533,11 +535,17 @@ class Runtime:
             body["data"] = data
         plaintext = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         envelope = self.keys.seal(post["key"], plaintext)
-        status, result = self.client.post(post["w"], envelope, self.keys.public, self.keys.sign(thread_signing_input(post["w"], envelope)))
+        notes = []
+        status, result = self._post(post["w"], envelope, notes)
         self.archive("board", {"kind": "answered", "at": time.time(), "post": post["id"], "w": post["w"], "status": status, "body": body})
         if status != 201:
             raise RuntimeError("answer failed: %s %s" % (status, result))
         answer = {"post": post["id"], "w": post["w"], "seq": result["seq"], "at": result["at"], "replies_arrive_on": "board", "reply_to": channel.w}
+        if "met" in result:
+            answer["met"] = result["met"]
+            answer["proof_id"] = result.get("proof_id")
+        if notes:
+            answer["notes"] = notes
         if own_post:
             answer["warning"] = "You answered your own post. The answer is sealed to your own key, so it reaches nobody but you."
         return answer
@@ -673,7 +681,7 @@ class Runtime:
             if note:
                 body["text"] = str(note)
             envelope = self.keys.seal(key, json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-            status, handed = self.client.post(reply_to, envelope, self.keys.public, self.keys.sign(thread_signing_input(reply_to, envelope)))
+            status, handed = self._post(reply_to, envelope, [])
             if status != 201:
                 raise RuntimeError("channel opened but the address could not be handed over: %s %s" % (status, handed))
         return {"label": label, "w": w, "expire_at": channel.expire_at, "with": self.name_for_key(key) or key, "address_sent_to": reply_to}
@@ -727,6 +735,10 @@ class Runtime:
                 raise LookupError("no key known for address %s; look the partner up or reply to a message" % w)
         else:
             w, key = self.address_for(to)
+        # What the inbox asks of writers is read before anything is stored, so
+        # a requirement this client cannot meet stops here with its reason,
+        # rather than as an outbox entry that can never be delivered.
+        gate_plan(self._gate_for(w), w)
         inbox = self.ensure_inbox()
         body = {"from": self.keys.hash[:8], "reply_to": reply_to or inbox.w}
         if text is not None:
@@ -755,7 +767,15 @@ class Runtime:
         if status != 201:
             raise SendFailed(entry["status"], entry["id"], status, result)
 
-        return {"to": record["to"], "w": entry["w"], "message_id": entry["id"], "seq": result["seq"], "at": result["at"], "sha256": result["sha256"], "expire_at": result["expire_at"]}
+        sent = {"to": record["to"], "w": entry["w"], "message_id": entry["id"], "seq": result["seq"], "at": result["at"], "sha256": result["sha256"], "expire_at": result["expire_at"]}
+        # Only from an inbox with a gate: what it found, and what the caller
+        # should hear although the message went out.
+        if "met" in result:
+            sent["met"] = result["met"]
+            sent["proof_id"] = result.get("proof_id")
+        if entry.get("gate_notes"):
+            sent["notes"] = entry["gate_notes"]
+        return sent
 
 
     # ----------------------------------------------------------- outbox --
@@ -780,13 +800,89 @@ class Runtime:
 
         return entry
 
+    # ------------------------------------------------------------- gate --
+
+    def _gate_for(self, w):
+        """What an inbox asks of writers, read once per address.
+
+        A gate never changes while its thread lives, so one read is enough. An
+        inbox without a gate, or one whose gate cannot be read right now, gives
+        {}: the message then goes out without work, and if the inbox did require
+        some, its 428 carries the gate and is answered once.
+        """
+        gates = getattr(self, "gates", None)
+
+        if gates is None:
+            gates = self.gates = {}
+
+        if w in gates:
+            return gates[w]
+
+        try:
+            status, data = self.client.gate(w)
+        except Exception:
+            status, data = 0, None
+
+        # Only a gate that was actually read is kept. A 404 is an inbox nobody
+        # has opened yet, and it may be opened with a gate a moment later.
+        if status == 200 and isinstance(data, dict):
+            gates[w] = data
+            return data
+
+        return {}
+
+    def _post(self, w, body_text, notes):
+        """POST to an inbox with the work its gate asks for, answering a 428 once.
+
+        Never more than one more attempt. Each costs a place in the rate window,
+        and a 428 after that means the inbox wants something this client cannot
+        give it. Work already done and refused anyway is not done again: the
+        same bytes give the same nonce and the same refusal. notes collects what
+        the caller should hear although the message went out.
+        """
+        signature = self.keys.sign(thread_signing_input(w, body_text))
+        advice = gate_plan(self._gate_for(w), w)
+        notes.extend(advice["notes"])
+        status, result = self._post_with_work(w, body_text, signature, advice["bits"])
+
+        if status == 428 and isinstance(result, dict) and isinstance(result.get("gate"), dict):
+            self.gates[w] = result["gate"]
+            asked = gate_plan(result["gate"], w)
+            notes.extend(note for note in asked["notes"] if note not in notes)
+
+            if asked["bits"] and asked["bits"] != advice["bits"]:
+                status, result = self._post_with_work(w, body_text, signature, asked["bits"])
+
+        return status, result
+
+    def _post_with_work(self, w, body_text, signature, bits):
+        if not bits:
+            return self.client.post(w, body_text, self.keys.public, signature)
+
+        return self.client.post(w, body_text, self.keys.public, signature, "text/plain", gate_solve(w, self.keys.public, body_text, bits))
+
+    # ----------------------------------------------------------- deliver --
+
     def _deliver(self, entry):
         """Send the stored bytes once, and record what the answer allows us to claim."""
         entry["attempts"] += 1
         entry["status"] = "sending"
         self.save_outbox()
-        signature = self.keys.sign(thread_signing_input(entry["w"], entry["envelope"]))
-        status, result = self.client.post(entry["w"], entry["envelope"], self.keys.public, signature)
+        notes = []
+
+        try:
+            status, result = self._post(entry["w"], entry["envelope"], notes)
+        except GateStop as stop:
+            # Nothing left this machine and nothing will: the entry is refused,
+            # not pending, and says why.
+            entry["status"] = "refused"
+            entry["error"] = stop.reason
+            entry["last_at"] = int(time.time())
+            self.save_outbox()
+            raise
+
+        if notes:
+            entry["gate_notes"] = notes
         entry["last_status"] = status
         entry["last_at"] = int(time.time())
 
