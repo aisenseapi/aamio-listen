@@ -8,13 +8,13 @@ build-backend = "setuptools.build_meta"
 # anyone who wrote against the name before it changed. A rename that breaks the
 # install of everyone already running it costs more than the name is worth.
 name = "aamio-listen"
-version = "0.4.1"
+version = "0.5.0"
 description = "Renamed to aamio. This package installs aamio and re-exports it, so existing imports keep working."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "AI SENSE AS" }]
-dependencies = ["aamio>=0.4.1"]
+dependencies = ["aamio>=0.5.0"]
 
 [project.urls]
 Homepage = "https://aamio.at"
