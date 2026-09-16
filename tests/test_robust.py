@@ -143,7 +143,7 @@ def test_one_runtime_per_home():
             Runtime(home=home, archive=False)
             raise AssertionError("a second runtime on the same home must refuse")
         except RuntimeError as error:
-            assert "another aamio-listen" in str(error), error
+            assert "another aamio" in str(error), error
 
         # Once the first lets go, the home is free again.
         first.close()

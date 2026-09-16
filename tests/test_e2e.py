@@ -119,8 +119,10 @@ def test_board():
 
         channel = poster.open_channel_with(replies[0]["from_key"], 120, reply_to=replies[0]["body"]["reply_to"], note="moving here")
         assert poster.channels[channel["label"]].allow == [answerer.keys.public]
-        answerer.read(wait=10)
-        handed = [e for e in answerer.board_replies() if isinstance(e["body"], dict) and e["body"].get("channel")]
+        # The handoff is an ordinary message, not an answer to a post, so it
+        # arrives by read and not in board_replies, which lists answers only.
+        arrived = answerer.read(wait=10)
+        handed = [e for e in arrived if isinstance(e["body"], dict) and e["body"].get("channel")]
         assert handed and handed[-1]["body"]["channel"] == channel["w"]
 
         tree = poster.board_tags()
