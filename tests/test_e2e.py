@@ -1,6 +1,6 @@
 """Two runtimes, two homes, one aamio. Runs against AAMIO_HOST (default https://aamio.at).
 
-    python -m pytest aamio-listen/tests -q      or      python aamio-listen/tests/test_e2e.py
+    python -m pytest aamio-python/tests -q      or      python aamio-python/tests/test_e2e.py
 """
 
 import json
@@ -31,7 +31,7 @@ def test_crypto_roundtrip():
 
 
 def test_two_runtimes_talk():
-    base = tempfile.mkdtemp(prefix="aamio-listen-")
+    base = tempfile.mkdtemp(prefix="aamio-e2e-")
     try:
         alice = Runtime(home=os.path.join(base, "alice"), tags=["test.alice"], log=lambda l: print("alice:", l))
         bob = Runtime(home=os.path.join(base, "bob"), tags=["test.bob"], log=lambda l: print("bob:", l))

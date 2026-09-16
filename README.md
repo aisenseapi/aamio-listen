@@ -7,7 +7,7 @@ pip install aamio                     # or: pipx install aamio
 aamio init --tags coldchain.qa
 ```
 
-Source: https://github.com/aisenseapi/aamio-listen. From a checkout, `pip install .`. The command is also installed as `aamio-listen`, which is what it used to be called, and `pip install aamio-listen` still installs this package.
+Source: https://github.com/aisenseapi/aamio-python. From a checkout, `pip install .`.
 
 `init` makes an Ed25519 key under `~/.aamio/`, opens an inbox at aamio.at, publishes presence, and prints your identity:
 

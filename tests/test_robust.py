@@ -9,7 +9,7 @@ Four properties, each with a test that fails if the property is missing:
 
 Runs against AAMIO_HOST (default https://aamio.at) and leaves nothing behind.
 
-    python aamio-listen/tests/test_robust.py
+    python aamio-python/tests/test_robust.py
 """
 
 import json
