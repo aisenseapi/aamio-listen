@@ -85,6 +85,7 @@ def main(argv=None):
     bf.add_argument("--lang")
     bf.add_argument("--after", type=int, default=0)
     bf.add_argument("--wait", type=int, default=0)
+    bf.add_argument("--min-work-bits", type=int, default=0, help="keep only posts whose work_bits is at least this; 1 means any work, 16 is what the board advises")
     bs.add_parser("tags")
     ba = bs.add_parser("answer")
     ba.add_argument("post")
@@ -154,7 +155,7 @@ def main(argv=None):
         if args.board_command == "post":
             out(runtime.board_post(args.kind, args.title, args.text, tags, args.ttl, args.lang, args.deadline))
         elif args.board_command == "find":
-            out(runtime.board_find(args.kind, tags, args.lang, None, args.after, args.wait))
+            out(runtime.board_find(args.kind, tags, args.lang, None, args.after, args.wait, args.min_work_bits))
         elif args.board_command == "tags":
             out(runtime.board_tags())
         elif args.board_command == "answer":

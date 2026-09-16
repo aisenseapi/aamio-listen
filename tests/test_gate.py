@@ -269,3 +269,109 @@ def test_a_stopped_send_reaches_the_model_with_a_fix():
     assert result["isError"] is True
     assert result["structuredContent"]["error_code"] == "gate"
     assert result["structuredContent"]["fix"] == "Update the client."
+
+
+# -------------------------------------------------------------------- board --
+
+from aamio.gate import board_advised_bits, board_pow_digest, board_pow_input, solve_board
+
+
+def board_runtime(home, descriptor):
+    """A runtime whose board is a fake: the descriptor given, posts recorded, a find that echoes its body."""
+    import time
+
+    runtime = object.__new__(Runtime)
+    runtime.home = home
+    runtime.lock = threading.RLock()
+    runtime.peers = {}
+    runtime.keys = SimpleNamespace(public=KEY, hash="0" * 64, sign=lambda text: "sig")
+    runtime.log = lambda line: None
+    runtime.archive = lambda label, record: None
+    runtime.ensure_board_inbox = lambda ttl: SimpleNamespace(w="w" * 20, expire_at=time.time() + 3600)
+    posts = []
+    reads = []
+
+    def board_post(body, key, signature, work=None):
+        posts.append({"body": body, "key": key, "work": work})
+        return 201, {"id": "p1", "work_bits": 4}
+
+    def board_descriptor():
+        reads.append(1)
+        return (200, descriptor) if descriptor is not None else (404, {"error": "no"})
+
+    runtime.client = SimpleNamespace(board_post=board_post, board_descriptor=board_descriptor, board_find=lambda body, wait=0: (200, {"posts": [], "next": 0, "count": 0, "live": 0, "sent": body}))
+
+    return runtime, posts, reads
+
+
+def board_reaches(post, bits):
+    return zero_bits(board_pow_digest(post["key"], hashlib.sha256(post["body"].encode("utf-8")).hexdigest(), post["work"])) >= bits
+
+
+def test_the_board_input_is_its_own_string():
+    assert board_pow_input("k", "h", "n") == "aamio-board-pow-v1\nk\nh\nn"
+    assert "aamio-board-v1\n" not in board_pow_input("k", "h", "n")
+
+
+def test_solve_board_reaches_the_bits():
+    nonce = solve_board(KEY, BODY, 8)
+
+    assert zero_bits(board_pow_digest(KEY, BODY_SHA256, nonce)) >= 8
+
+
+def test_the_advised_bits_come_from_the_descriptor_and_stop_at_the_ceiling():
+    assert board_advised_bits({"work": {"advise_bits": 16}}) == 16
+    assert board_advised_bits({"work": {"advise_bits": 18}}) == 18
+    assert board_advised_bits({"work": {"advise_bits": 19}}) == 0
+    assert board_advised_bits({"work": {"advise_bits": 0}}) == 0
+    assert board_advised_bits({"limits": {}}) == 0
+    assert board_advised_bits(None) == 0
+
+
+def test_a_post_carries_the_work_the_board_advises(home):
+    runtime, posts, _ = board_runtime(home, {"work": {"advise_bits": 4}})
+
+    runtime.board_post("need", "t", "x")
+
+    assert len(posts) == 1 and posts[0]["work"] is not None
+    assert board_reaches(posts[0], 4)
+
+
+def test_a_board_that_advises_nothing_gets_no_header(home):
+    runtime, posts, _ = board_runtime(home, {"limits": {}})
+
+    runtime.board_post("need", "t", "x")
+
+    assert posts[0]["work"] is None
+
+
+def test_a_board_that_advises_more_than_the_ceiling_is_passed_over(home):
+    runtime, posts, _ = board_runtime(home, {"work": {"advise_bits": 19}})
+
+    runtime.board_post("need", "t", "x")
+
+    assert posts[0]["work"] is None
+
+
+def test_a_descriptor_that_cannot_be_read_means_no_work(home):
+    runtime, posts, _ = board_runtime(home, None)
+
+    runtime.board_post("need", "t", "x")
+
+    assert posts[0]["work"] is None
+
+
+def test_the_descriptor_is_read_once(home):
+    runtime, posts, reads = board_runtime(home, {"work": {"advise_bits": 4}})
+
+    runtime.board_post("need", "one", "x")
+    runtime.board_post("need", "two", "x")
+
+    assert len(posts) == 2 and reads == [1]
+
+
+def test_min_work_bits_is_sent_only_when_asked_for(home):
+    runtime, _, _ = board_runtime(home, {"work": {"advise_bits": 4}})
+
+    assert "min_work_bits" not in runtime.board_find()["sent"]
+    assert runtime.board_find(min_work_bits=16)["sent"]["min_work_bits"] == 16

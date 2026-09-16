@@ -19,7 +19,7 @@ import threading
 import time
 
 from .client import AamioClient, DEFAULT_HOST
-from .gate import GateStop, plan as gate_plan, solve as gate_solve
+from .gate import GateStop, board_advised_bits, plan as gate_plan, solve as gate_solve, solve_board
 from .crypto import Keys, board_delete_signing_input, board_signing_input, is_envelope, is_key, key_hash, presence_signing_input, sha256hex, thread_signing_input, unb64url
 
 INBOX_TTL = 3600
@@ -447,14 +447,36 @@ class Runtime:
         if deadline:
             fields["deadline"] = deadline
         body = json.dumps(fields, ensure_ascii=False, separators=(",", ":"))
-        status, data = self.client.board_post(body, self.keys.public, self.keys.sign(board_signing_input(self.keys.public, body)))
+        # The work the board advises is done without asking, as on an inbox,
+        # over the same bytes that are signed. The number is the board's, read
+        # from its descriptor once, never a constant of ours: a board that
+        # advises none gets no header.
+        bits = self._board_advised_bits()
+        work = solve_board(self.keys.public, body, bits) if bits else None
+        status, data = self.client.board_post(body, self.keys.public, self.keys.sign(board_signing_input(self.keys.public, body)), work)
         if status not in (200, 201):
             raise RuntimeError("board post failed: %s %s" % (status, data))
         self.archive("board", {"kind": "posted", "at": time.time(), "post": data})
         return {"post": data, "inbox": channel.w, "answers_arrive_on": "board"}
 
-    def board_find(self, kind=None, tags=None, lang=None, key=None, after=0, wait=0):
-        """Live posts that match. A tag covers its dotted children."""
+    def _board_advised_bits(self):
+        """What the board advises posts to carry, read from its descriptor once per runtime."""
+        cached = getattr(self, "board_advised_bits", None)
+
+        if cached is not None:
+            return cached
+
+        try:
+            status, descriptor = self.client.board_descriptor()
+        except Exception:
+            status, descriptor = 0, None
+
+        self.board_advised_bits = board_advised_bits(descriptor) if status == 200 else 0
+
+        return self.board_advised_bits
+
+    def board_find(self, kind=None, tags=None, lang=None, key=None, after=0, wait=0, min_work_bits=0):
+        """Live posts that match. A tag covers its dotted children. min_work_bits keeps only posts whose work_bits is at least that."""
         body = {"after": int(after)}
         if kind:
             body["kind"] = kind
@@ -466,6 +488,8 @@ class Runtime:
             body["key"] = key
         if wait:
             body["wait"] = min(int(wait), 25)
+        if min_work_bits:
+            body["min_work_bits"] = int(min_work_bits)
         status, data = self.client.board_find(body, int(wait or 0))
         if status != 200:
             raise RuntimeError("board find failed: %s %s" % (status, data))

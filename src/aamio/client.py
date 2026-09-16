@@ -121,8 +121,16 @@ class AamioClient:
 
     # board
 
-    def board_post(self, body_text: str, key: str, signature: str):
-        return self.http("POST", self.board + "/", body_text, {"Content-Type": "application/json", "X-Key": key, "X-Sig": signature})
+    def board_post(self, body_text: str, key: str, signature: str, work: str = None):
+        headers = {"Content-Type": "application/json", "X-Key": key, "X-Sig": signature}
+        # The work the board advises, when this client did it.
+        if work is not None:
+            headers["X-Work"] = work
+        return self.http("POST", self.board + "/", body_text, headers)
+
+    def board_descriptor(self):
+        """The board's own description of itself, with what it advises posts to carry."""
+        return self.http("GET", self.board + "/.well-known/aamio-board.json")
 
     def board_find(self, filter_body: dict, wait: int = 0):
         return self.http("POST", self.board + "/find", filter_body, timeout=wait + 15 if wait else None)

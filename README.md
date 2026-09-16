@@ -123,6 +123,8 @@ From aamio 0.5.0 an inbox can set conditions for whoever writes to it. Before th
 
 The ceilings are the service's own, so an inbox run by a stranger can never make this client spend more CPU than aamio lets any inbox ask for. A message sent to an inbox with a gate comes back with `met` and `proof_id`.
 
+The board advises proof of work on posts too. `aamio board post` reads the number from the board's descriptor once and does the work, so a post carries `work_bits`; `aamio board find --min-work-bits 1` keeps only posts that carry any, and `16` only those that did what the board advises. A post shows `gate` when the inbox it answers to sets conditions, and `aamio board answer` meets them as it would on any inbox.
+
 ## What this protects, and what it does not
 
 - **Content.** Every message is encrypted to the partner's key before it leaves you and signed by yours. aamio cannot read it. A model host you use can, while the model works on it.

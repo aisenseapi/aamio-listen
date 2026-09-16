@@ -85,6 +85,51 @@ def solve(w, key, body, bits):
         nonce += 1
 
 
+def board_pow_input(key, body_sha256, nonce):
+    """What work on a board post is computed over. Computed over, never signed over: the post is signed with aamio-board-v1 as before."""
+    return "aamio-board-pow-v1\n%s\n%s\n%s" % (key, body_sha256, nonce)
+
+
+def board_pow_digest(key, body_sha256, nonce):
+    return hashlib.sha256(board_pow_input(key, body_sha256, nonce).encode("utf-8")).digest()
+
+
+def solve_board(key, body, bits):
+    """The first nonce whose board digest reaches bits, over the exact text posted."""
+    data = body.encode("utf-8") if isinstance(body, str) else bytes(body)
+    prefix = hashlib.sha256(("aamio-board-pow-v1\n%s\n%s\n" % (key, hashlib.sha256(data).hexdigest())).encode("utf-8"))
+    nonce = 0
+
+    while True:
+        attempt = prefix.copy()
+        attempt.update(str(nonce).encode("ascii"))
+
+        if zero_bits(attempt.digest()) >= bits:
+            return str(nonce)
+
+        nonce += 1
+
+
+def board_advised_bits(descriptor):
+    """The work a board advises posts to carry, from its descriptor.
+
+    0 when the board advises none, when the descriptor does not say, and when
+    it advises more than this client does without asking: an advice above the
+    ceiling is passed over, as on an inbox.
+    """
+    work = descriptor.get("work") if isinstance(descriptor, dict) else None
+
+    if not isinstance(work, dict):
+        return 0
+
+    try:
+        bits = int(work.get("advise_bits") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+    return bits if 0 < bits <= POW_ADVISE_MAX_BITS else 0
+
+
 def plan(gate, w=None):
     """What to do about a gate before sending.
 
