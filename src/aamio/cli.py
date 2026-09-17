@@ -213,7 +213,14 @@ def run(args, runtime):
                 runtime.read(args.wait)
             # The address comes with the answers. An empty list means one of
             # two very different things, and only this tells them apart.
-            out({"replies": runtime.board_replies(args.post), "reply_address": runtime.board_reply_address()})
+            replies = runtime.board_replies(args.post)
+            answer = {"replies": replies, "reply_address": runtime.board_reply_address()}
+            if args.post is not None:
+                # What else is on the board inbox, so an empty list for one
+                # post is never read as an empty inbox.
+                everything = runtime.board_replies()
+                answer["others_on_the_board_inbox"] = len(everything) - len(replies)
+            out(answer)
         elif args.board_command == "withdraw":
             out(runtime.board_withdraw(args.post))
         else:

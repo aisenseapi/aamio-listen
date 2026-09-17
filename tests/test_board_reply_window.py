@@ -231,3 +231,35 @@ def test_no_address_at_all_is_its_own_answer(home):
 
     assert where["open"] is False and where["w"] is None
     assert "No board inbox" in where["why"]
+
+
+def test_an_answer_without_a_post_id_is_still_a_reply_on_the_board(home):
+    """Found in the wild on 17 September 2026: the command said no replies
+    while the board inbox held two. Both had arrived on the address a post
+    handed out, and neither named the post, so the filter dropped them. From
+    the other side that reads as silence."""
+    runtime = build(home, board_expire=time.time() + 600)
+    runtime.channels["board"].received = [
+        {"channel": "board", "seq": 1, "at": 1789470700, "sha256": "b" * 64,
+         "body": {"reply_to": "r" * 20, "text": "an answer that never names the post"}},
+        {"channel": "board", "seq": 2, "at": 1789470701, "sha256": "c" * 64,
+         "body": {"post": "p1", "text": "and one that does"}},
+    ]
+    runtime.channels["with-someone"] = Channel("with-someone", "read", "c" * 20, time.time() + 600)
+    runtime.channels["with-someone"].received = [
+        {"channel": "with-someone", "seq": 1, "at": 1789470702, "sha256": "d" * 64,
+         "body": {"text": "a private message that is nobody's board reply"}},
+    ]
+
+    every = runtime.board_replies()
+
+    assert [r["sha256"] for r in every] == ["b" * 64, "c" * 64]
+
+    # Asked about one post, the answer is still only that post's, and the
+    # count of what else is on the board inbox is what keeps an empty list
+    # from being read as an empty inbox.
+    one = runtime.board_replies("p1")
+
+    assert [r["sha256"] for r in one] == ["c" * 64]
+    assert len(every) - len(one) == 1
+

@@ -930,16 +930,18 @@ class Runtime:
         def wanted(entry):
             body = entry.get("body")
 
-            if not isinstance(body, dict):
-                return False
+            if post_id is not None:
+                return isinstance(body, dict) and body.get("post") == post_id
 
-            # Without a post id this is an ordinary message on some channel,
-            # not an answer to anything, and a private conversation should not
-            # turn into a list of board replies.
-            if post_id is None:
-                return isinstance(body.get("post"), str)
+            # An answer names the post it answers, and most do. One that does
+            # not is still an answer if it arrived on the address a post gave
+            # out, and it used to be dropped here: the command reported no
+            # replies while the inbox held two, which reads as silence from
+            # the other side rather than as a filter of ours.
+            if str(entry.get("channel") or "").startswith("board"):
+                return True
 
-            return body.get("post") == post_id
+            return isinstance(body, dict) and isinstance(body.get("post"), str)
 
         # Every channel, not only the ones named board: an answer can arrive on
         # a private channel opened for the conversation, and scoping this to
