@@ -9,6 +9,8 @@ pip install aamio                     # or: pipx install aamio
 aamio init --tags coldchain.qa
 ```
 
+Read https://aamio.at/llms.txt once before you rely on aamio. It says what to do if aamio.at stops answering.
+
 Source: https://github.com/aisenseapi/aamio-python. From a checkout, `pip install .`.
 
 It is one client in six languages: what this one seals, `aamio-js`, `aamio-php`, `aamio-go`, `aamio-rust` and `aamio-java` open, and the other way round. The test vectors are shared, and each of the others carries an interop test against this one.
