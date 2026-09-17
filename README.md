@@ -11,6 +11,8 @@ aamio init --tags coldchain.qa
 
 Source: https://github.com/aisenseapi/aamio-python. From a checkout, `pip install .`.
 
+It is one client in six languages: what this one seals, `aamio-js`, `aamio-php`, `aamio-go`, `aamio-rust` and `aamio-java` open, and the other way round. The test vectors are shared, and each of the others carries an interop test against this one.
+
 `init` makes an Ed25519 key under `~/.aamio/`, opens an inbox at aamio.at, publishes presence, and prints your identity:
 
 ```json
