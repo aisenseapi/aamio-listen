@@ -835,8 +835,19 @@ class Runtime:
         return data
 
     def board_get(self, post_id):
+        """The post, or None when the board says there is none. Anything else raises.
+
+        Every status but 200 used to be None, and the caller turned None into
+        "no live post with that id". A board that was down, rate limiting or
+        unreachable was therefore reported as a post that does not exist, which
+        is the opposite of what a reader should do about it.
+        """
         status, data = self.client.board_get(post_id)
-        return data if status == 200 else None
+        if status == 200:
+            return data
+        if status in (404, 410):
+            return None
+        raise RuntimeError("the board answered %s for post %s, so whether that post is live is unknown. Ask again rather than treating it as gone" % (status, post_id))
 
     def board_tags(self):
         status, data = self.client.board_tags()
@@ -974,7 +985,7 @@ class Runtime:
 
         return out
 
-    def _archive_labels(self, prefix="board"):
+    def _archive_labels(self, prefix=""):
         """Labels this runtime has an archive for, the ones a board inbox uses."""
         home = getattr(self, "home", None)
 
@@ -983,7 +994,8 @@ class Runtime:
 
         try:
             names = os.listdir(os.path.join(home, "archive"))
-        except OSError:
+        except OSError as error:
+            self._note_trouble("archive", "unread", "the archive could not be listed (%s), so answers written down earlier are not in this result" % error.__class__.__name__)
             return set()
 
         return {name[: -len(".jsonl")] for name in names if name.endswith(".jsonl") and name.startswith(prefix)}
@@ -1462,12 +1474,15 @@ class Runtime:
 
     def _note(self, channel, state, what):
         """Something a caller has to hear about, even though the read returned no messages."""
-        note = {"channel": channel.label, "w": channel.w, "state": state, "what": what, "at": int(time.time())}
+        self._note_trouble(channel.label, state, what, w=channel.w)
+
+    def _note_trouble(self, where, state, what, w=None):
+        note = {"channel": where, "w": w, "state": state, "what": what, "at": int(time.time())}
         with self.lock:
             if not hasattr(self, "attention"):
                 self.attention = {}
-            self.attention[(channel.label, state)] = note
-        self.log("%s: %s" % (channel.label, what))
+            self.attention[(where, state)] = note
+        self.log("%s: %s" % (where, what))
 
     def attention_taken(self):
         """What the reads since the last call could not do, once, and then cleared."""
@@ -1598,11 +1613,19 @@ class Runtime:
             self.ensure_inbox()
             self.publish_presence()
             collected = []
-            first = True
+            waited = False
             for channel in list(self.channels.values()):
-                state, entries = self.poll(channel, wait if first else 0)
-                first = False
+                state, entries = self.poll(channel, 0 if waited else wait)
+                # A channel that answered 410 or nothing at all used to eat the
+                # whole wait, so a read with wait 25 came back at once and the
+                # inbox was only ever asked with wait 0.
+                waited = waited or state == "ok"
                 collected.extend(entries)
+            if len(collected) > limit:
+                # The cursor has already moved past all of them. The surplus is
+                # in the archive, and a read will not hand it over again, so
+                # saying nothing here loses messages the runtime did receive.
+                self._note_trouble("read", "truncated", "%d more messages were read than this call hands over, and the cursor has moved past them. They are in the archive, and another read will not bring them back. Ask for a higher limit to see them here." % (len(collected) - limit))
             return collected[:limit]
         collected = []
         deadline = time.time() + max(0, int(wait))

@@ -92,3 +92,53 @@ def test_the_model_is_told_over_mcp_as_well():
 
     # Nothing to say, so nothing is said: a quiet inbox stays quiet.
     assert "attention" not in quiet["structuredContent"]
+
+
+def test_a_read_that_hands_over_less_than_it_took_says_so():
+    """poll moves the cursor and saves it before the caller sees a message, so
+    whatever read cuts off the end is past the cursor and will not come back."""
+    many = [{"seq": n, "at": n, "verified": True, "from": "k", "sha256": "%064d" % n, "body": "{}"} for n in range(1, 61)]
+    runtime = build([(200, {"messages": many})])
+    runtime._open = lambda message: ({"text": "x"}, {"signed": True, "encrypted": False, "format": "json"})
+    got = runtime.read(limit=50)
+    attention = runtime.attention_taken()
+
+    assert len(got) == 50
+    assert [(a["channel"], a["state"]) for a in attention] == [("read", "truncated")]
+    assert "10 more messages" in attention[0]["what"]
+
+
+def test_a_dead_channel_does_not_eat_the_whole_wait():
+    """The first channel used to spend the wait whether or not it answered."""
+    asked = []
+
+    def read(w, read_key, after, wait):
+        asked.append((w, wait))
+        return (410, {}) if w.startswith("d") else (200, {"messages": []})
+
+    runtime = build([])
+    runtime.channels = {
+        "dead": Channel("dead", "read-key", "d" * 20, time.time() + 600),
+        "inbox": Channel("inbox", "read-key", "i" * 20, time.time() + 600),
+    }
+    runtime.ensure_inbox = lambda: runtime.channels["inbox"]
+    runtime.client = SimpleNamespace(read=read)
+    runtime.read(wait=25)
+
+    assert asked == [("d" * 20, 25), ("i" * 20, 25)]
+
+
+def test_a_board_that_did_not_answer_is_not_a_post_that_does_not_exist():
+    runtime = build([])
+    runtime.client = SimpleNamespace(board_get=lambda post_id: (0, {"error": "no answer"}))
+
+    try:
+        runtime.board_get("p" * 20)
+        raise AssertionError("a board that did not answer must not look like a missing post")
+    except RuntimeError as error:
+        assert "unknown" in str(error) and "gone" in str(error)
+
+    runtime.client = SimpleNamespace(board_get=lambda post_id: (404, {"error": "No live post with this id"}))
+
+    assert runtime.board_get("p" * 20) is None
+
