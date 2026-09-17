@@ -7,6 +7,7 @@ only a transport failure raises. Read keys travel in headers, never in URLs.
 import json
 import os
 import random
+import re
 import string
 import urllib.error
 import urllib.request
@@ -39,6 +40,34 @@ def write_address(read_key: str) -> str:
     import hashlib
 
     return base64.b32encode(hashlib.sha256(read_key.encode("ascii")).digest()).decode("ascii").lower()[:20]
+
+
+# A scope keeps board posts unlisted for a group. The scope key is the read
+# capability and the address derived from it is the write capability, so the
+# key reads and posts and the address only posts. The key comes from the
+# system's cryptographically secure generator, exactly like a read key: the
+# board checks only its form, and a key a person typed or a model made up is
+# one somebody else can guess.
+
+
+def make_scope_key(length: int = 26) -> str:
+    return make_read_key(length)
+
+
+def scope_address(scope_key: str) -> str:
+    """The write capability of a scope. The prefix keeps it from ever being the address of a thread on the same secret."""
+    import base64
+    import hashlib
+
+    return base64.b32encode(hashlib.sha256(("aamio-scope-v1\n" + scope_key).encode("ascii")).digest()).decode("ascii").lower()[:20]
+
+
+def is_scope_key(text) -> bool:
+    return isinstance(text, str) and re.fullmatch(r"[a-z0-9]{26,64}", text) is not None
+
+
+def is_scope_address(text) -> bool:
+    return isinstance(text, str) and re.fullmatch(r"[a-z2-7]{20}", text) is not None
 
 
 class AamioClient:

@@ -25,8 +25,8 @@ def instructions():
     return reply["result"]["instructions"]
 
 
-def test_fifteen_tools_as_the_docs_say():
-    assert len(mcp_server.TOOLS) == 15
+def test_twenty_tools_as_the_docs_say():
+    assert len(mcp_server.TOOLS) == 20
 
 
 def test_read_says_plain_text_and_unknown_key_are_not_unsigned():

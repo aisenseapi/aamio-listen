@@ -4,6 +4,7 @@ State lives under AAMIO_HOME (default ~/.aamio):
 
     key              32-byte seed, hex, mode 600. The runtime's identity.
     partners.json    [{"name": ..., "key": ...}] from the contract. Keys, not addresses.
+    scopes.json      [{"name": ..., "key": ..., "address": ...}], mode 600. Scope keys stay here.
     state.json       open channels (read keys, mode 600), learned peers, tags.
     archive/*.jsonl  decrypted messages and receipts, per channel. The party's own record.
 
@@ -18,7 +19,7 @@ import re
 import threading
 import time
 
-from .client import AamioClient, DEFAULT_HOST
+from .client import AamioClient, DEFAULT_HOST, is_scope_address, is_scope_key, make_scope_key, scope_address
 from .gate import GateStop, board_advised_bits, plan as gate_plan, solve as gate_solve, solve_board
 from .crypto import Keys, board_delete_signing_input, board_signing_input, is_envelope, is_key, key_hash, presence_signing_input, sha256hex, thread_signing_input, unb64url
 
@@ -38,6 +39,75 @@ RENEW_BEFORE = 180
 
 def home_dir() -> str:
     return os.environ.get("AAMIO_HOME") or os.path.join(os.path.expanduser("~"), ".aamio")
+
+
+def pid_alive(pid):
+    """Whether a process with this pid is running, without touching it.
+
+    os.kill(pid, 0) asks that on POSIX. On Windows it is TerminateProcess:
+    it ended whatever process held the pid, and then reported it as alive.
+    A lock file outlives its process and Windows hands pids out again
+    quickly, so the process ended was as often somebody else's program as
+    an old aamio. There the question goes to OpenProcess instead.
+    """
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            # Access denied means the process is there and not ours to look at.
+            return ctypes.get_last_error() == 5
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def process_started_at(pid):
+    """When the process with this pid started, in Unix seconds, or None where that cannot be asked cheaply.
+
+    A pid is handed out again once its process is gone, so a live pid in a
+    lock file is not proof of a live owner. A process that started after the
+    lock was written is some other program that got the number.
+    """
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return None
+            try:
+                created, ignored = ctypes.c_ulonglong(), (ctypes.c_ulonglong * 3)()
+                if not kernel32.GetProcessTimes(ctypes.c_void_p(handle), ctypes.byref(created), ctypes.byref(ignored, 0), ctypes.byref(ignored, 8), ctypes.byref(ignored, 16)):
+                    return None
+                # 100 nanosecond steps since 1601.
+                return created.value / 1e7 - 11644473600
+            finally:
+                kernel32.CloseHandle(ctypes.c_void_p(handle))
+        with open("/proc/%d/stat" % int(pid), encoding="ascii", errors="replace") as handle:
+            ticks = int(handle.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/stat", encoding="ascii", errors="replace") as handle:
+            boot = next(int(line.split()[1]) for line in handle if line.startswith("btime "))
+        return boot + ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, StopIteration, AttributeError):
+        return None
 
 
 # Homes locked by this process. The file on disk catches another process;
@@ -142,17 +212,31 @@ class Channel:
 
 
 class Runtime:
+    # Files a runtime writes back. One that is there and cannot be read stops
+    # the runtime before anything is saved over it: a save is how a broken
+    # file becomes a lost one, with the channels, partners or scope keys in it.
+    KEPT_FILES = ("partners.json", "scopes.json", "state.json", "outbox.json", "effects.json")
+
     def __init__(self, home=None, host=None, tags=None, archive=True, log=None):
         self.home = home or home_dir()
         self.host = host or os.environ.get("AAMIO_HOST") or DEFAULT_HOST
         self.client = AamioClient(self.host)
         self.archive_enabled = archive
         self.log = log or (lambda line: None)
+        self.closed = False
         os.makedirs(self.home, exist_ok=True)
         os.makedirs(os.path.join(self.home, "archive"), exist_ok=True)
         self.owns_lock = self._take_lock()
+        try:
+            self._load(tags)
+        except BaseException:
+            self._release_lock()
+            raise
+
+    def _load(self, tags):
         self.keys = self._load_or_create_keys()
         self.partners = self._load_json("partners.json", [])
+        self.scopes, self.scopes_aside = self._usable_scopes(self._load_json("scopes.json", []))
         state = self._load_json("state.json", {})
         self.tags = tags if tags is not None else state.get("tags") or [t for t in (os.environ.get("AAMIO_TAGS") or "").split(",") if t]
         self.peers = dict(state.get("peers") or {})          # write address -> partner key
@@ -194,17 +278,22 @@ class Runtime:
         held = self._load_json("lock", None)
 
         if isinstance(held, dict) and isinstance(held.get("pid"), int) and held["pid"] != os.getpid():
-            alive = True
             try:
-                os.kill(held["pid"], 0)
-            except OSError:
-                alive = False
+                alive = pid_alive(held["pid"])
             except Exception:
                 alive = True
 
+            if alive and isinstance(held.get("at"), (int, float)):
+                # The lock is written after its owner started. A process that
+                # started later got the pid after the owner was gone.
+                started = process_started_at(held["pid"])
+                if started is not None and started > held["at"] + 2:
+                    alive = False
+
             if alive:
                 raise RuntimeError(
-                    "another aamio (pid %s) is using %s. Stop it, or use a different AAMIO_HOME." % (held["pid"], self.home)
+                    "another aamio (pid %s) is using %s. Stop it, or use a different AAMIO_HOME. If no aamio is running, "
+                    "the one that took the lock stopped without letting go of it: delete %s and start again." % (held["pid"], self.home, self._path("lock"))
                 )
 
         self._save_json("lock", {"pid": os.getpid(), "at": int(time.time()), "host": self.host})
@@ -230,40 +319,68 @@ class Runtime:
         return os.path.join(self.home, name)
 
     def _load_json(self, name, default):
+        """What a file holds, or default when it is not there or empty.
+
+        A file in KEPT_FILES that is there and cannot be read, or holds
+        something other than the list or object it should, raises instead.
+        """
         try:
-            with open(self._path(name), "r", encoding="utf-8") as handle:
-                return json.load(handle)
-        except (OSError, ValueError):
+            with open(self._path(name), "rb") as handle:
+                text = handle.read().decode("utf-8")
+            value = json.loads(text) if text.strip() else default
+        except FileNotFoundError:
             return default
+        except (OSError, ValueError) as error:
+            if name not in self.KEPT_FILES:
+                return default
+            why = "not UTF-8 JSON" if isinstance(error, ValueError) else error.__class__.__name__
+            raise RuntimeError(self._unreadable(name, why)) from None
+        if name in self.KEPT_FILES and not isinstance(value, type(default)):
+            raise RuntimeError(self._unreadable(name, "not a JSON %s" % ("list" if isinstance(default, list) else "object")))
+        return value
+
+    def _unreadable(self, name, why):
+        return (
+            "%s could not be read (%s), so this runtime stops here rather than save over it. Repair the file, "
+            "or move it away to start without what was in it." % (self._path(name), why)
+        )
 
     def _save_json(self, name, value, private=False):
         path = self._path(name)
-        with open(path + ".tmp", "w", encoding="utf-8") as handle:
+        # Private from the first byte. Made 600 after the rename, the file was
+        # readable by anyone for a moment, and the temporary one for longer.
+        handle = os.fdopen(os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o666), "w", encoding="utf-8")
+        with handle:
             json.dump(value, handle, ensure_ascii=False, indent=2)
             handle.flush()
             # The rename is atomic, but only over bytes that reached the disk.
             os.fsync(handle.fileno())
-        os.replace(path + ".tmp", path)
         if private:
             try:
-                os.chmod(path, 0o600)
+                os.chmod(path + ".tmp", 0o600)
             except OSError:
                 pass
+        os.replace(path + ".tmp", path)
 
     def _load_or_create_keys(self):
         path = self._path("key")
         try:
             with open(path, "r", encoding="utf-8") as handle:
-                return Keys(bytes.fromhex(handle.read().strip()))
-        except (OSError, ValueError):
-            keys = Keys.generate()
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(keys.seed.hex() + "\n")
-            try:
-                os.chmod(path, 0o600)
-            except OSError:
-                pass
-            return keys
+                text = handle.read().strip()
+        except FileNotFoundError:
+            text = ""
+        except (OSError, ValueError) as error:
+            raise RuntimeError(self._unreadable("key", error.__class__.__name__)) from None
+        if text:
+            # A new key over it would be a new identity, and the old one gone
+            # for good. Partners know this runtime by that key.
+            if re.fullmatch(r"[0-9a-f]{64}", text) is None:
+                raise RuntimeError(self._unreadable("key", "not a 64 character hex seed"))
+            return Keys(bytes.fromhex(text))
+        keys = Keys.generate()
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as handle:
+            handle.write(keys.seed.hex() + "\n")
+        return keys
 
     def save_state(self):
         with self.lock:
@@ -330,6 +447,189 @@ class Runtime:
     def name_for_key(self, key):
         p = self.partner_by_key(key)
         return p["name"] if p else None
+
+    # ----------------------------------------------------------- scopes --
+    #
+    # A scope keeps board posts unlisted for a group. Here each one has a name,
+    # and the name is all a caller passes or sees. The key is the read
+    # capability: it stays in scopes.json, and scope_share hands it to a partner
+    # sealed, so no model has to hold it. The address is the write capability
+    # and is no secret. Unlisted is not private.
+
+    SCOPE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+    def _usable_scopes(self, entries):
+        """The entries of scopes.json this runtime can use, and the rest.
+
+        The rest are never dropped. They go back into the file on every save
+        as they were, so a hand edit with a typo is there to be corrected
+        rather than gone with the key in it.
+        """
+        usable, aside, names = [], [], set()
+        for entry in entries:
+            key = entry.get("key") if isinstance(entry, dict) else None
+            if (
+                isinstance(entry, dict)
+                and isinstance(entry.get("name"), str)
+                and self.SCOPE_NAME.fullmatch(entry["name"]) is not None
+                and entry["name"].lower() not in names
+                and is_scope_address(entry.get("address"))
+                and (key is None or (is_scope_key(key) and scope_address(key) == entry["address"]))
+            ):
+                usable.append(entry)
+                names.add(entry["name"].lower())
+            else:
+                aside.append(entry)
+        if aside:
+            self.log("scopes.json: %d entries are not scopes this runtime can use, and stay in the file as they are" % len(aside))
+        return usable, aside
+
+    def _save_scopes(self, scopes):
+        """Writes the scopes, and only then holds them: a save that fails changes nothing."""
+        with self.lock:
+            self._save_json("scopes.json", scopes + getattr(self, "scopes_aside", []), private=True)
+            self.scopes = scopes
+
+    def _scope(self, name):
+        for entry in self.scopes:
+            if entry["name"].lower() == str(name).lower():
+                return entry
+        return None
+
+    def _scope_named(self, name):
+        entry = self._scope(name)
+        if entry is None:
+            raise LookupError("no scope called %s here. The scope list shows the ones this runtime holds" % name)
+        return entry
+
+    @staticmethod
+    def _scope_view(entry):
+        return {"name": entry["name"], "address": entry["address"], "can_read": bool(entry.get("key"))}
+
+    def _scope_name_ok(self, name):
+        if not isinstance(name, str) or self.SCOPE_NAME.fullmatch(name) is None:
+            raise ValueError("a scope name is 1 to 64 letters, digits, dots, dashes and underscores, starting with a letter or a digit")
+
+    def scope_new(self, name):
+        """A new scope, its key from the system's secure generator. The key stays here."""
+        self._scope_name_ok(name)
+        with self.lock:
+            if self._scope(name) is not None:
+                raise ValueError("there is a scope called %s already" % name)
+            key = make_scope_key()
+            entry = {"name": name, "key": key, "address": scope_address(key)}
+            self._save_scopes(self.scopes + [entry])
+        return self._scope_view(entry)
+
+    def scope_add(self, name, key=None, address=None):
+        """A scope made elsewhere: the key, to read and post, or the address, to post only."""
+        self._scope_name_ok(name)
+        if key is None and address is None:
+            raise ValueError("give the key, to read and post, or the address, to post only")
+        if key is not None and not is_scope_key(key):
+            raise ValueError("a scope key is 26 to 64 characters of a-z and 0-9. The 20 character address goes in address")
+        if address is not None and not is_scope_address(address):
+            raise ValueError("a scope address is the 20 characters of a-z and 2-7 that go on a post")
+        derived = scope_address(key) if key is not None else address
+        if address is not None and derived != address:
+            raise ValueError("that key does not give that address, so one of the two is wrong")
+        with self.lock:
+            named = self._scope(name)
+            if named is not None and named["address"] != derived:
+                raise ValueError("there is a scope called %s already, with another address. Remove it or choose another name" % name)
+            held = named or next((s for s in self.scopes if s["address"] == derived), None)
+            if held is None:
+                held = {"name": name, "key": key, "address": derived}
+                self._save_scopes(self.scopes + [held])
+            elif key is not None and not held.get("key"):
+                # Held to post only until now. The key adds reading.
+                before, held = held, dict(held, key=key)
+                self._save_scopes([held if s is before else s for s in self.scopes])
+        return self._scope_view(held)
+
+    def scope_list(self):
+        return [self._scope_view(entry) for entry in self.scopes]
+
+    def scope_remove(self, name):
+        with self.lock:
+            entry = self._scope_named(name)
+            self._save_scopes([s for s in self.scopes if s is not entry])
+        return {"removed": entry["name"]}
+
+    def scope_key(self, name):
+        """The key itself, for a person to pass on by hand. The MCP server never calls this."""
+        entry = self._scope_named(name)
+        if not entry.get("key"):
+            raise ValueError("scope %s is held to post only, so there is no key here" % entry["name"])
+        return {"name": entry["name"], "key": entry["key"], "address": entry["address"]}
+
+    def scope_share(self, name, to, access):
+        """Hand a scope to a partner in a sealed message. read gives the key, write only the address.
+
+        Only to a partner in the address book, by name or key. An address is
+        learned from the board and from messages, so it can be anyone's, and
+        the key would be sealed to whoever it was learned from: a post asking
+        for a scope would get it.
+        """
+        entry = self._scope_named(name)
+        if access not in ("read", "write"):
+            raise ValueError("access is read, which gives the key to read and post, or write, which gives the address to post only")
+        if access == "read" and not entry.get("key"):
+            raise ValueError("scope %s is held to post only, so it can only be shared with access write" % entry["name"])
+        partner = self.partner_by_key(to) if is_key(str(to)) else self.partner_by_name(to)
+        if partner is None:
+            raise ValueError("a scope is shared only with a partner in your address book, by name. Never with an address, which can be anyone's")
+        share = {"name": entry["name"], "key": entry["key"]} if access == "read" else {"name": entry["name"], "address": entry["address"]}
+        w, key = self.address_for(partner["name"])
+        # The archive keeps what was shared and with whom, never the key.
+        sent = self._send(w, key, partner["name"], "Scope %s, shared to %s." % (entry["name"], "read and post" if access == "read" else "post only"), {"aamio_scope": share}, archived_data={"aamio_scope": {"name": entry["name"], "access": access}})
+        return dict(sent, scope=entry["name"], access=access)
+
+    def _shared_scope_name(self, partner, name):
+        """The name a scope from a partner is kept under: the partner's name, a dot and the scope's.
+
+        A partner names its own scopes, and a name is where posts go. Kept
+        under the bare name, a partner could take review before review was
+        made here, and the posts meant for it would go where that partner reads.
+        """
+        self._scope_name_ok(name)
+        prefix = re.sub(r"[^A-Za-z0-9._-]+", "-", partner["name"]).strip("._-")[:24] or key_hash(partner["key"])[:8]
+        return ("%s.%s" % (prefix, name))[:64]
+
+    def _take_scope_share(self, entry):
+        """A scope in an incoming message. Kept only when it came sealed and
+        verified from a partner in the address book, and not seen before. The
+        key is taken out of the message either way, and aamio_scope is replaced
+        whatever it holds and wherever it sits, so whoever reads the message
+        never sees a key in it."""
+        body = entry.get("body")
+        if not isinstance(body, dict):
+            return
+        if "aamio_scope" in body:
+            body["aamio_scope"] = {"kept": False, "note": "not kept: a scope is shared in data.aamio_scope"}
+        data = body.get("data")
+        if not isinstance(data, dict) or "aamio_scope" not in data:
+            return
+        share = data["aamio_scope"]
+        if not isinstance(share, dict):
+            data["aamio_scope"] = {"kept": False, "note": "not kept: data.aamio_scope is an object with name, and key or address"}
+            return
+        key = share.get("key")
+        view = {"shared_as": share.get("name") if isinstance(share.get("name"), str) else None, "can_read": key is not None, "kept": False}
+        partner = self.partner_by_key(entry.get("from_key")) if entry.get("from_key") else None
+        if not (entry.get("verified") and entry.get("encrypted") and entry.get("known_contact") and partner is not None):
+            view["note"] = "not kept: a scope is only taken when it comes sealed from a partner in your address book"
+        elif entry.get("replay"):
+            view["note"] = "not kept again: this message arrived before, and a scope removed since stays removed"
+        else:
+            try:
+                local = self._shared_scope_name(partner, share.get("name"))
+                view.update(self.scope_add(local, key=key, address=None if key is not None else share.get("address")), kept=True)
+            except Exception as error:
+                # This share alone, and nothing held that was not saved. The
+                # rest of the messages are delivered either way.
+                view["note"] = "not kept: %s" % error
+        data["aamio_scope"] = view
 
     # ------------------------------------------------------------ inbox --
 
@@ -429,8 +729,15 @@ class Runtime:
             self._start_poller(channel)
         return channel
 
-    def board_post(self, kind, title, text, tags=None, ttl=BOARD_TTL, lang=None, deadline=None):
-        """Put a need or an offer on the board. The reply inbox is opened for you."""
+    def board_post(self, kind, title, text, tags=None, ttl=BOARD_TTL, lang=None, deadline=None, scope=None):
+        """Put a need or an offer on the board. The reply inbox is opened for you.
+
+        With scope, the name of a scope held here, the post carries that
+        scope's address and is unlisted: only a find with the scope's key
+        returns it. Unlisted is not private.
+        """
+        # Before the inbox is opened, so a name that is not here costs nothing.
+        held = self._scope_named(scope) if scope is not None else None
         channel = self.ensure_board_inbox(int(ttl))
         # The board refuses a post that would outlive the inbox behind it, so
         # that an address on the board is always an address that still works.
@@ -446,6 +753,9 @@ class Runtime:
             fields["lang"] = lang
         if deadline:
             fields["deadline"] = deadline
+        if held is not None:
+            # Inside the signed body, so nobody can post the same bytes without it.
+            fields["scope"] = held["address"]
         body = json.dumps(fields, ensure_ascii=False, separators=(",", ":"))
         # The work the board advises is done without asking, as on an inbox,
         # over the same bytes that are signed. The number is the board's, read
@@ -457,7 +767,10 @@ class Runtime:
         if status not in (200, 201):
             raise RuntimeError("board post failed: %s %s" % (status, data))
         self.archive("board", {"kind": "posted", "at": time.time(), "post": data})
-        return {"post": data, "inbox": channel.w, "answers_arrive_on": "board"}
+        posted = {"post": data, "inbox": channel.w, "answers_arrive_on": "board"}
+        if held is not None:
+            posted["scope"] = held["name"]
+        return posted
 
     def _board_advised_bits(self):
         """What the board advises posts to carry, read from its descriptor once per runtime."""
@@ -475,8 +788,15 @@ class Runtime:
 
         return self.board_advised_bits
 
-    def board_find(self, kind=None, tags=None, lang=None, key=None, after=0, wait=0, min_work_bits=0):
-        """Live posts that match. A tag covers its dotted children. min_work_bits keeps only posts whose work_bits is at least that."""
+    def board_find(self, kind=None, tags=None, lang=None, key=None, after=0, wait=0, min_work_bits=0, scope=None):
+        """Live posts that match. A tag covers its dotted children. min_work_bits keeps only posts whose work_bits is at least that.
+
+        With scope, the name of a scope held here with its key, the find reads
+        that scope instead of the public board.
+        """
+        held = self._scope_named(scope) if scope is not None else None
+        if held is not None and not held.get("key"):
+            raise ValueError("scope %s is held to post only. Reading it takes the key, which a partner can share with access read" % held["name"])
         body = {"after": int(after)}
         if kind:
             body["kind"] = kind
@@ -490,9 +810,18 @@ class Runtime:
             body["wait"] = min(int(wait), 25)
         if min_work_bits:
             body["min_work_bits"] = int(min_work_bits)
+        if held is not None:
+            # In the body and nowhere else. A board older than scopes answers
+            # 400 to the field, so it never reads the public board instead.
+            body["scope_key"] = held["key"]
         status, data = self.client.board_find(body, int(wait or 0))
         if status != 200:
             raise RuntimeError("board find failed: %s %s" % (status, data))
+        if held is not None:
+            # The answer names the scope it read. Without that it did not read this one.
+            if data.get("scope") != held["address"]:
+                raise RuntimeError("the board did not say it read scope %s, so these posts are not shown" % held["name"])
+            data["scope_name"] = held["name"]
         for post in data.get("posts", []):
             if post.get("w") and post.get("key"):
                 with self.lock:
@@ -517,16 +846,27 @@ class Runtime:
         self.archive("board", {"kind": "withdrawn", "at": time.time(), "id": post_id})
         return data
 
-    def board_answer(self, post, text=None, data=None):
+    def board_answer(self, post, text=None, data=None, scope=None):
         """Answer a post, sealed to the poster's key and signed by ours.
 
         The message carries the post id and our reply address, so the poster
-        can sort answers by post and write back.
+        can sort answers by post and write back. A post in a scope is never
+        served by id alone, so with scope the post is looked up in that scope.
         """
         if isinstance(post, str):
-            post = self.board_get(post)
+            post_id = post
+            post = self.board_get(post_id) if scope is None else None
+            after = 0
+            # A page holds up to 200 posts, and a scope can hold more. The
+            # cursor goes on until the post turns up or the pages run out.
+            for _ in range(50 if scope is not None else 0):
+                page = self.board_find(scope=scope, after=after)
+                post = next((p for p in page.get("posts", []) if p.get("id") == post_id), None)
+                if post is not None or not page.get("posts") or int(page.get("next") or 0) <= after:
+                    break
+                after = int(page["next"])
             if post is None:
-                raise LookupError("no live post with that id")
+                raise LookupError("no live post with that id" + (" in scope %s" % scope if scope is not None else ". A post in a scope is found with the scope's name"))
         # The address on this answer has to outlive the post it answers.
         #
         # It did not. ensure_board_inbox() defaults to 900, which opens a
@@ -753,12 +1093,20 @@ class Runtime:
                 raise ValueError("key is not in partners")
             to = partner["name"]
         if isinstance(to, str) and re.fullmatch(r"[a-z2-7]{20}", to):
-            w = to
-            key = self.peers.get(w)
+            key = self.peers.get(to)
             if key is None:
-                raise LookupError("no key known for address %s; look the partner up or reply to a message" % w)
-        else:
-            w, key = self.address_for(to)
+                raise LookupError("no key known for address %s; look the partner up or reply to a message" % to)
+            return self._send(to, key, None, text, data, reply_to)
+        w, key = self.address_for(to)
+        return self._send(w, key, to, text, data, reply_to)
+
+    def _send(self, w, key, partner, text=None, data=None, reply_to=None, archived_data=None):
+        """One message sealed to key and written to w.
+
+        partner is the name presence is asked again with when that address has
+        gone, and None for an address given as it is. archived_data stands in
+        for data in the archive, for a message carrying what no file should.
+        """
         # What the inbox asks of writers is read before anything is stored, so
         # a requirement this client cannot meet stops here with its reason,
         # rather than as an outbox entry that can never be delivered.
@@ -777,15 +1125,16 @@ class Runtime:
         entry = self._outbox_add(w, key, envelope, body)
         status, result = self._deliver(entry)
 
-        if status in (404, 410) and not (isinstance(to, str) and to == w):
+        if status in (404, 410) and partner is not None:
             # The partner may have renewed its inbox. Ask presence again, once.
             # A new address means new bytes, so this is a new outbox entry.
-            w, key = self.address_for(to)
+            w, key = self.address_for(partner)
             envelope = self.keys.seal(key, plaintext)
             entry = self._outbox_add(w, key, envelope, body, replaces=entry["id"])
             status, result = self._deliver(entry)
 
-        record = {"kind": "sent", "at": time.time(), "to": self.name_for_key(key) or key, "w": entry["w"], "status": status, "message_id": entry["id"], "outcome": entry["status"], "seq": (result or {}).get("seq") if isinstance(result, dict) else None, "sha256": (result or {}).get("sha256") if isinstance(result, dict) else None, "body": body}
+        archived = body if archived_data is None else dict(body, data=archived_data)
+        record = {"kind": "sent", "at": time.time(), "to": self.name_for_key(key) or key, "w": entry["w"], "status": status, "message_id": entry["id"], "outcome": entry["status"], "seq": (result or {}).get("seq") if isinstance(result, dict) else None, "sha256": (result or {}).get("sha256") if isinstance(result, dict) else None, "body": archived}
         self.archive("sent", record)
 
         if status != 201:
@@ -1109,6 +1458,9 @@ class Runtime:
                 body, meta = {"text": message.get("body")}, {"signed": bool(message.get("from")), "encrypted": False, "format": "undecodable", "error": error.__class__.__name__}
             entry["body"] = body
             entry.update(meta)
+            # Before the message is kept, archived or shown: a scope key in it
+            # goes to scopes.json or nowhere, never to the reader.
+            self._take_scope_share(entry)
             if isinstance(entry["body"], dict) and isinstance(entry["body"].get("reply_to"), str) and message["from"]:
                 with self.lock:
                     self.peers[entry["body"]["reply_to"]] = message["from"]
@@ -1263,7 +1615,17 @@ class Runtime:
         return result
 
     def close(self):
+        """Stops the listener, saves what it holds and lets go of the home, once."""
+        if getattr(self, "closed", False):
+            return
+        self.closed = True
         self.stop.set()
-        self.save_state()
-        self.save_outbox()
+        try:
+            self.save_state()
+            self.save_outbox()
+        finally:
+            self._release_lock()
+
+    def release(self):
+        """Lets go of the home without saving, for a command that saved what it changed as it went."""
         self._release_lock()

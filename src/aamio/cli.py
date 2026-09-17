@@ -9,6 +9,12 @@
     aamio send NAME TEXT           encrypt, sign, send
     aamio read [--wait 25]         read new messages
     aamio receipt [--channel inbox] [--anchor]
+    aamio scope new NAME           a scope with a key from the system's secure generator
+    aamio scope add NAME --key KEY | --address ADDRESS
+    aamio scope list               names, addresses and whether each can read
+    aamio scope key NAME           the key, to pass on by hand
+    aamio scope share NAME PARTNER --access read|write
+    aamio scope remove NAME
     aamio serve                    MCP server on stdio
 
 
@@ -79,6 +85,7 @@ def main(argv=None):
     bp.add_argument("--ttl", type=int, default=BOARD_TTL)
     bp.add_argument("--lang")
     bp.add_argument("--deadline")
+    bp.add_argument("--scope", help="the name of one of your scopes: the post is then unlisted, and unlisted is not private")
     bf = bs.add_parser("find")
     bf.add_argument("--kind", choices=["need", "offer"])
     bf.add_argument("--tags", default="")
@@ -86,10 +93,12 @@ def main(argv=None):
     bf.add_argument("--after", type=int, default=0)
     bf.add_argument("--wait", type=int, default=0)
     bf.add_argument("--min-work-bits", type=int, default=0, help="keep only posts whose work_bits is at least this; 1 means any work, 16 is what the board advises")
+    bf.add_argument("--scope", help="the name of a scope you hold with its key: read that scope instead of the public board")
     bs.add_parser("tags")
     ba = bs.add_parser("answer")
     ba.add_argument("post")
     ba.add_argument("text")
+    ba.add_argument("--scope", help="the name of the scope the post is in")
     br = bs.add_parser("replies")
     br.add_argument("--post")
     br.add_argument("--wait", type=int, default=0)
@@ -100,6 +109,24 @@ def main(argv=None):
     bc.add_argument("--ttl", type=int, default=900)
     bc.add_argument("--reply-to")
     bc.add_argument("--note")
+
+    p = sub.add_parser("scope")
+    ss = p.add_subparsers(dest="scope_command", required=True)
+    sn = ss.add_parser("new")
+    sn.add_argument("name")
+    sa = ss.add_parser("add")
+    sa.add_argument("name")
+    sa.add_argument("--key", help="26 to 64 characters of a-z and 0-9: read and post. A key typed here stays in the shell history, so scope share from runtime to runtime is better")
+    sa.add_argument("--address", help="the 20 characters that go on a post: post only")
+    ss.add_parser("list")
+    sk = ss.add_parser("key")
+    sk.add_argument("name")
+    sh = ss.add_parser("share")
+    sh.add_argument("name")
+    sh.add_argument("partner")
+    sh.add_argument("--access", choices=["read", "write"], required=True)
+    sr = ss.add_parser("remove")
+    sr.add_argument("name")
 
     p = sub.add_parser("outbox")
     os_ = p.add_subparsers(dest="outbox_command", required=True)
@@ -113,8 +140,25 @@ def main(argv=None):
 
     args = parser.parse_args(argv)
     tags = [t for t in args.tags.split(",") if t] if getattr(args, "tags", None) else None
-    runtime = Runtime(home=args.home, host=args.host, tags=tags, archive=not args.no_archive, log=lambda line: print(line, file=sys.stderr))
+    try:
+        runtime = Runtime(home=args.home, host=args.host, tags=tags, archive=not args.no_archive, log=lambda line: print(line, file=sys.stderr))
+    except RuntimeError as error:
+        # Another runtime holds the home, or a file in it cannot be read. The
+        # reason is the whole message, and it is not a crash.
+        print("aamio: %s" % error, file=sys.stderr)
+        return 1
+    try:
+        return run(args, runtime)
+    finally:
+        # One command, one process: the lock goes with it, as in aamio-php.
+        # Left behind, the next command had to guess from a pid whether an
+        # old owner still lived, and on Windows pids come back quickly. Only
+        # the lock: every command saves what it changed as it goes, and a
+        # save on the way out would write files a command only read.
+        runtime.release()
 
+
+def run(args, runtime):
     if args.command == "init":
         runtime.ensure_inbox()
         runtime.save_state()
@@ -153,14 +197,14 @@ def main(argv=None):
     elif args.command == "board":
         tags = [t for t in getattr(args, "tags", "").split(",") if t]
         if args.board_command == "post":
-            out(runtime.board_post(args.kind, args.title, args.text, tags, args.ttl, args.lang, args.deadline))
+            out(runtime.board_post(args.kind, args.title, args.text, tags, args.ttl, args.lang, args.deadline, args.scope))
         elif args.board_command == "find":
-            out(runtime.board_find(args.kind, tags, args.lang, None, args.after, args.wait, args.min_work_bits))
+            out(runtime.board_find(args.kind, tags, args.lang, None, args.after, args.wait, args.min_work_bits, args.scope))
         elif args.board_command == "tags":
             out(runtime.board_tags())
         elif args.board_command == "answer":
             try:
-                out(runtime.board_answer(args.post, args.text))
+                out(runtime.board_answer(args.post, args.text, scope=args.scope))
             except GateStop as stop:
                 out({"error": stop.reason, "error_code": "gate", "fix": stop.fix})
                 return 1
@@ -174,6 +218,19 @@ def main(argv=None):
             out(runtime.board_withdraw(args.post))
         else:
             out(runtime.open_channel_with(args.key, args.ttl, None, args.reply_to, args.note))
+    elif args.command == "scope":
+        if args.scope_command == "new":
+            out(runtime.scope_new(args.name))
+        elif args.scope_command == "add":
+            out(runtime.scope_add(args.name, args.key, args.address))
+        elif args.scope_command == "list":
+            out({"scopes": runtime.scope_list()})
+        elif args.scope_command == "key":
+            out(runtime.scope_key(args.name))
+        elif args.scope_command == "share":
+            out(runtime.scope_share(args.name, args.partner, args.access))
+        else:
+            out(runtime.scope_remove(args.name))
     elif args.command == "outbox":
         if args.outbox_command == "pending":
             out({"pending": runtime.outbox_pending()})
