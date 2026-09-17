@@ -263,3 +263,28 @@ def test_an_answer_without_a_post_id_is_still_a_reply_on_the_board(home):
     assert [r["sha256"] for r in one] == ["c" * 64]
     assert len(every) - len(one) == 1
 
+
+def test_an_answer_on_a_board_inbox_that_has_been_renewed_is_still_found(home):
+    """A board inbox is renewed while the old one still holds answers. The old
+    channel keeps its own label and its own archive, and once it expires it is
+    dropped from the runtime. Reading only the channels this process holds made
+    those answers vanish from `board replies` although they had arrived, been
+    decrypted and been written down."""
+    os.makedirs(os.path.join(home, "archive"), exist_ok=True)
+    record = {
+        "kind": "received", "channel": "board-1789470000", "seq": 1, "at": 1789470000,
+        "verified": True, "known_contact": False, "from_key": "their-key",
+        "sender": "unknown key", "sha256": "e" * 64,
+        "body": {"post": "p9", "reply_to": "r" * 20, "text": "answered before the inbox was renewed"},
+    }
+
+    with open(os.path.join(home, "archive", "board-1789470000.jsonl"), "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+    # A runtime that holds only the new board inbox, as it would after the
+    # renewal and a restart.
+    runtime = build(home, board_expire=time.time() + 600)
+
+    assert [r["sha256"] for r in runtime.board_replies("p9")] == ["e" * 64]
+    assert [r["sha256"] for r in runtime.board_replies()] == ["e" * 64]
+

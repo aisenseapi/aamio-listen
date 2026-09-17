@@ -184,7 +184,10 @@ def run(args, runtime):
             out({"error": stop.reason, "error_code": "gate", "fix": stop.fix})
             return 1
     elif args.command == "read":
-        out({"messages": runtime.read(args.wait)})
+        # attention carries what the read could not do. Without it an expired
+        # thread and a service that did not answer both read as "no messages".
+        messages = runtime.read(args.wait)
+        out({"messages": messages, "count": len(messages), "attention": runtime.attention_taken()})
     elif args.command == "receipt":
         out(runtime.receipt(args.channel, args.anchor))
     elif args.command == "channel":
@@ -214,7 +217,7 @@ def run(args, runtime):
             # The address comes with the answers. An empty list means one of
             # two very different things, and only this tells them apart.
             replies = runtime.board_replies(args.post)
-            answer = {"replies": replies, "reply_address": runtime.board_reply_address()}
+            answer = {"replies": replies, "reply_address": runtime.board_reply_address(), "attention": runtime.attention_taken()}
             if args.post is not None:
                 # What else is on the board inbox, so an empty list for one
                 # post is never read as an empty inbox.

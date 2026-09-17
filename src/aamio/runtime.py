@@ -256,6 +256,12 @@ class Runtime:
                 entry["status"] = "unknown"
                 entry["note"] = "the process stopped while this was in flight"
         self.presence_at = 0.0
+        # What a read could not do, kept by channel and state until it is
+        # handed to a caller. An empty read means nothing arrived. An empty
+        # read on a thread that has expired, or that the service would not
+        # answer for, means something else entirely, and both used to look
+        # exactly the same from outside.
+        self.attention = {}
         self.inbound = queue.Queue()
         self.lock = threading.RLock()
         self.stop = threading.Event()
@@ -953,7 +959,12 @@ class Runtime:
                         seen.add(entry.get("sha256"))
                         out.append(entry)
 
-        for label in sorted(set(self.channels) | {"board"}):
+        # A board inbox is renewed while the old one still holds answers, and
+        # the old one keeps its own label and its own archive. Once that
+        # channel expires it leaves self.channels, and reading only the
+        # channels this process holds made those answers vanish from here
+        # although they had arrived, been decrypted and been written down.
+        for label in sorted(self._archive_labels() | set(self.channels) | {"board"}):
             for entry in self._archived(label, "received"):
                 if wanted(entry) and entry.get("sha256") not in seen:
                     seen.add(entry.get("sha256"))
@@ -962,6 +973,20 @@ class Runtime:
         out.sort(key=lambda e: (e.get("at") or 0, e.get("seq") or 0))
 
         return out
+
+    def _archive_labels(self, prefix="board"):
+        """Labels this runtime has an archive for, the ones a board inbox uses."""
+        home = getattr(self, "home", None)
+
+        if not home or not getattr(self, "archive_enabled", False):
+            return set()
+
+        try:
+            names = os.listdir(os.path.join(home, "archive"))
+        except OSError:
+            return set()
+
+        return {name[: -len(".jsonl")] for name in names if name.endswith(".jsonl") and name.startswith(prefix)}
 
     def _archived(self, label, kind):
         """Entries this client wrote down for a channel, oldest first. Silent
@@ -1435,11 +1460,29 @@ class Runtime:
 
         return {"text": parsed}, {"signed": True, "encrypted": True, "format": "json"}
 
+    def _note(self, channel, state, what):
+        """Something a caller has to hear about, even though the read returned no messages."""
+        note = {"channel": channel.label, "w": channel.w, "state": state, "what": what, "at": int(time.time())}
+        with self.lock:
+            if not hasattr(self, "attention"):
+                self.attention = {}
+            self.attention[(channel.label, state)] = note
+        self.log("%s: %s" % (channel.label, what))
+
+    def attention_taken(self):
+        """What the reads since the last call could not do, once, and then cleared."""
+        with self.lock:
+            taken = sorted(getattr(self, "attention", {}).values(), key=lambda note: (note["at"], note["channel"]))
+            self.attention = {}
+        return taken
+
     def poll(self, channel, wait=0):
         status, data = self.client.read(channel.w, channel.read_key, channel.after, wait)
         if status == 410:
+            self._note(channel, "expired", "the thread at this address has expired, so anything written to it before now is gone and nothing more will arrive here")
             return "expired", []
         if status != 200:
+            self._note(channel, "unread", "the service answered %s, so this channel was not read and there may be messages waiting" % status)
             return "error", []
         entries = []
         for message in data.get("messages", []):
