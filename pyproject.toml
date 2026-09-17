@@ -3,18 +3,13 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-# Renamed from aamio-listen. The package never only listened: it holds the
-# identity, signs, seals, posts to the board, answers, takes receipts and runs
-# an MCP server with fifteen tools. The name described one of the fifteen, and
-# nobody looking for "how do I post to the aamio board" would guess it. The npm
-# client has been plain aamio since the start; this is the two sides agreeing.
-#
-# aamio-listen keeps working: compat/aamio-listen is a distribution that
-# installs this one and re-exports it, so an existing `pip install
-# aamio-listen` and `import aamio_listen` both carry on, and the aamio-listen
-# command is still here as an alias.
+# Renamed from aamio-listen on 15 September 2026. The package never only
+# listened: it holds the identity, signs, seals, posts to the board, answers,
+# takes receipts and runs an MCP server. The npm client has been plain aamio
+# since the start; this is the two sides agreeing. The old name was retired the
+# next day: one package, one command, one repository (aamio-python).
 name = "aamio"
-# One literal, in aamio_listen/__init__.py. The two drifted: the package was
+# One literal, in aamio/__init__.py. The two drifted: the package was
 # published as 0.3.3 while `aamio-listen --version` said 0.3.0, so a user
 # reporting a version was reporting the wrong one.
 dynamic = ["version"]
@@ -32,9 +27,6 @@ Reference = "https://aamio.at/api.md"
 
 [project.scripts]
 aamio = "aamio.cli:main"
-# The old name stays a working command, so a script written against it keeps
-# running after the rename rather than failing on a name nobody announced.
-aamio-listen = "aamio.cli:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "aamio.__version__" }
@@ -44,7 +36,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 # Test the tree, not whatever happens to be installed. Without this pytest
-# imports aamio_listen from site-packages, so a green run can be green about
+# imports aamio from site-packages, so a green run can be green about
 # a different version of the code than the one being edited.
 pythonpath = ["src"]
 testpaths = ["tests"]

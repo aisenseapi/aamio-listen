@@ -11,7 +11,6 @@
     aamio receipt [--channel inbox] [--anchor]
     aamio serve                    MCP server on stdio
 
-The command is also installed as aamio-listen, which is what it used to be called.
 
 Environment: AAMIO_HOME (default ~/.aamio), AAMIO_HOST (default https://aamio.at), AAMIO_TAGS.
 """
