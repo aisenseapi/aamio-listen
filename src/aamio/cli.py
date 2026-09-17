@@ -12,7 +12,8 @@
     aamio serve                    MCP server on stdio
 
 
-Environment: AAMIO_HOME (default ~/.aamio), AAMIO_HOST (default https://aamio.at), AAMIO_TAGS.
+Environment: AAMIO_HOME (default ~/.aamio) and AAMIO_TAGS, and AAMIO_HOST, AAMIO_BOARD
+and AAMIO_VERIFYUM over the hosts at the top of aamio/client.py.
 """
 
 import argparse

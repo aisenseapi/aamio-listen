@@ -762,7 +762,7 @@ class Runtime:
         # What the inbox asks of writers is read before anything is stored, so
         # a requirement this client cannot meet stops here with its reason,
         # rather than as an outbox entry that can never be delivered.
-        gate_plan(self._gate_for(w), w)
+        gate_plan(self._gate_for(w), w, self.host)
         inbox = self.ensure_inbox()
         body = {"from": self.keys.hash[:8], "reply_to": reply_to or inbox.w}
         if text is not None:
@@ -865,13 +865,13 @@ class Runtime:
         the caller should hear although the message went out.
         """
         signature = self.keys.sign(thread_signing_input(w, body_text))
-        advice = gate_plan(self._gate_for(w), w)
+        advice = gate_plan(self._gate_for(w), w, self.host)
         notes.extend(advice["notes"])
         status, result = self._post_with_work(w, body_text, signature, advice["bits"])
 
         if status == 428 and isinstance(result, dict) and isinstance(result.get("gate"), dict):
             self.gates[w] = result["gate"]
-            asked = gate_plan(result["gate"], w)
+            asked = gate_plan(result["gate"], w, self.host)
             notes.extend(note for note in asked["notes"] if note not in notes)
 
             if asked["bits"] and asked["bits"] != advice["bits"]:

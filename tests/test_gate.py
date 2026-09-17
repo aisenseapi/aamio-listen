@@ -140,6 +140,7 @@ def home():
 def build(home, gate, answers):
     """A runtime with a fake network: gate() answers the gate given, post() the answers in order."""
     runtime = object.__new__(Runtime)
+    runtime.host = "https://aamio.test"
     runtime.home = home
     runtime.lock = threading.RLock()
     runtime.keys = SimpleNamespace(public=KEY, hash="0" * 64, sign=lambda text: "sig")
@@ -281,6 +282,7 @@ def board_runtime(home, descriptor):
     import time
 
     runtime = object.__new__(Runtime)
+    runtime.host = "https://aamio.test"
     runtime.home = home
     runtime.lock = threading.RLock()
     runtime.peers = {}

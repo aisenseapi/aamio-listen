@@ -48,6 +48,7 @@ def home():
 
 def build(home, board_expire=None):
     runtime = object.__new__(Runtime)
+    runtime.host = "https://aamio.test"
     runtime.home = home
     runtime.lock = threading.RLock()
     runtime.channels = {}

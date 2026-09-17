@@ -14,6 +14,15 @@ import urllib.request
 from . import __version__
 from .crypto import b64url, sha256hex
 
+# Where this client points unless told otherwise, all in one place. Read
+# DEFAULT_HOST + "/llms.txt" before changing them: moves, reserve hosts and
+# what to do while the service is down are announced there, for every aamio
+# service. Change them here to move every default at once. AamioClient takes
+# other hosts as arguments and otherwise reads AAMIO_HOST, AAMIO_BOARD and
+# AAMIO_VERIFYUM, so the runtime, the command line and the MCP server follow.
+# No other line of code names a host. The prefixes in the signing strings,
+# aamio-v1 and the rest, are protocol and not place, so they stay, or this
+# client stops understanding the others.
 DEFAULT_HOST = "https://aamio.at"
 DEFAULT_BOARD = "https://board.aamio.at"
 VERIFYUM_MCP = "https://api.verifyum.com/mcp"
@@ -33,10 +42,11 @@ def write_address(read_key: str) -> str:
 
 
 class AamioClient:
-    def __init__(self, host: str = DEFAULT_HOST, timeout: int = 60, board: str = None):
-        self.host = host.rstrip("/")
+    def __init__(self, host: str = None, timeout: int = 60, board: str = None, verifyum: str = None):
+        self.host = (host or os.environ.get("AAMIO_HOST") or DEFAULT_HOST).rstrip("/")
         self.timeout = timeout
         self.board = (board or os.environ.get("AAMIO_BOARD") or DEFAULT_BOARD).rstrip("/")
+        self.verifyum = (verifyum or os.environ.get("AAMIO_VERIFYUM") or VERIFYUM_MCP).rstrip("/")
 
     def http(self, method: str, url: str, body=None, headers=None, timeout=None):
         data = None
@@ -156,7 +166,7 @@ class AamioClient:
 
     def anchor(self, root_hex: str, idempotency_key: str):
         message = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "verifyum_anchor_commitment", "arguments": {"commitment": "sha256:" + root_hex, "idempotency_key": idempotency_key}}}
-        status, reply = self.http("POST", VERIFYUM_MCP, message, {"MCP-Protocol-Version": "2025-11-25"})
+        status, reply = self.http("POST", self.verifyum, message, {"MCP-Protocol-Version": "2025-11-25"})
         try:
             return status, json.loads(reply["result"]["content"][0]["text"])
         except Exception:
@@ -164,7 +174,7 @@ class AamioClient:
 
     def proof(self, proof_id: str):
         message = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "verifyum_get_proof", "arguments": {"proof_id": proof_id}}}
-        status, reply = self.http("POST", VERIFYUM_MCP, message, {"MCP-Protocol-Version": "2025-11-25"})
+        status, reply = self.http("POST", self.verifyum, message, {"MCP-Protocol-Version": "2025-11-25"})
         try:
             return status, json.loads(reply["result"]["content"][0]["text"])
         except Exception:

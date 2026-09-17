@@ -19,6 +19,8 @@ would skip.
 
 import hashlib
 
+from .client import DEFAULT_HOST
+
 POW_REQUIRE_MAX_BITS = 20
 POW_ADVISE_MAX_BITS = 18
 
@@ -130,15 +132,15 @@ def board_advised_bits(descriptor):
     return bits if 0 < bits <= POW_ADVISE_MAX_BITS else 0
 
 
-def plan(gate, w=None):
-    """What to do about a gate before sending.
+def plan(gate, w=None, host=None):
+    """What to do about a gate before sending to w on host, DEFAULT_HOST when not given.
 
     Returns {"bits": the work to do or None, "required": bool, "notes": [str]},
     notes being what a caller should be told although the send goes ahead.
     Raises GateStop when the send must not go ahead at all.
     """
     gate = gate if isinstance(gate, dict) else {}
-    where = "GET https://aamio.at/%s/gate" % w if w else "GET /{w}/gate on the inbox"
+    where = "GET %s/%s/gate" % ((host or DEFAULT_HOST).rstrip("/"), w) if w else "GET /{w}/gate on the inbox"
     notes = []
 
     for bucket, conditions in gate.items():
