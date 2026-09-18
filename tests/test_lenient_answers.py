@@ -35,6 +35,7 @@ def deliver(body, verified=True, sender="a-verified-key", sealed_to=None):
     runtime.name_for_key = lambda key: None
     runtime.archive = lambda *args: None
     runtime.save_state = lambda: None
+    runtime.log = lambda *args: None
     if sealed_to is not None:
         runtime.keys = SimpleNamespace(open=lambda frm, text: json.dumps(sealed_to).encode("utf-8"))
     message = {
@@ -86,6 +87,7 @@ def test_a_sealed_message_that_will_not_open_says_so_without_pretending():
     runtime.name_for_key = lambda key: None
     runtime.archive = lambda *args: None
     runtime.save_state = lambda: None
+    runtime.log = lambda *args: None
 
     def refuse(frm, text):
         raise ValueError("not for this key")
@@ -151,6 +153,8 @@ def test_an_answer_on_another_channel_is_still_found():
     board = Channel("board", "r1", "b" * 20, 2000000000)
     private = Channel("Arctic Freight", "r2", "c" * 20, 2000000000)
     runtime.channels = {"board": board, "Arctic Freight": private}
+    runtime.lock = threading.Lock()
+    runtime.log = lambda *args: None
     private.received.append({"channel": "Arctic Freight", "at": 5, "body": {"post": "p1", "text": "yes"}})
     board.received.append({"channel": "board", "at": 4, "body": {"post": "p2", "text": "other"}})
 
@@ -164,6 +168,8 @@ def test_a_private_thread_does_not_become_a_list_of_board_answers():
     runtime = object.__new__(Runtime)
     private = Channel("Arctic Freight", "r2", "c" * 20, 2000000000)
     runtime.channels = {"Arctic Freight": private}
+    runtime.lock = threading.Lock()
+    runtime.log = lambda *args: None
     private.received.append({"channel": "Arctic Freight", "at": 5, "body": {"text": "an ordinary message"}})
     assert runtime.board_replies() == []
 
@@ -178,6 +184,7 @@ def test_one_undecodable_message_does_not_cost_the_others():
     runtime.name_for_key = lambda key: None
     runtime.archive = lambda *args: None
     runtime.save_state = lambda: None
+    runtime.log = lambda *args: None
     messages = [
         {"verified": True, "from": "k", "body": json.dumps({"post": "p1", "text": {"toString": 1}, "reply": "hi"}), "seq": 1, "at": 1, "sha256": "h1"},
         {"verified": True, "from": "k", "body": json.dumps({"post": "p1", "text": "an ordinary answer"}), "seq": 2, "at": 2, "sha256": "h2"},

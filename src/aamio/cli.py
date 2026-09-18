@@ -99,7 +99,7 @@ def main(argv=None):
     ba.add_argument("post")
     ba.add_argument("text")
     ba.add_argument("--scope", help="the name of the scope the post is in")
-    br = bs.add_parser("replies")
+    br = bs.add_parser("replies", help="answers to your posts. This filters. read shows everything on the inbox, including messages that name no post and bodies that could not be opened")
     br.add_argument("--post")
     br.add_argument("--wait", type=int, default=0)
     bw = bs.add_parser("withdraw")
@@ -217,12 +217,14 @@ def run(args, runtime):
             # The address comes with the answers. An empty list means one of
             # two very different things, and only this tells them apart.
             replies = runtime.board_replies(args.post)
-            answer = {"replies": replies, "reply_address": runtime.board_reply_address(), "attention": runtime.attention_taken()}
+            answer = {"replies": replies, "reply_address": runtime.board_reply_address()}
             if args.post is not None:
                 # What else is on the board inbox, so an empty list for one
                 # post is never read as an empty inbox.
                 everything = runtime.board_replies()
                 answer["others_on_the_board_inbox"] = len(everything) - len(replies)
+            # Last, so it carries what both calls above had to say.
+            answer["attention"] = runtime.attention_taken()
             out(answer)
         elif args.board_command == "withdraw":
             out(runtime.board_withdraw(args.post))

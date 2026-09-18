@@ -943,6 +943,7 @@ class Runtime:
         """
         out = []
         seen = set()
+        skipped = []
 
         def wanted(entry):
             body = entry.get("body")
@@ -966,9 +967,11 @@ class Runtime:
         for channel in list(self.channels.values()):
             with channel.lock:
                 for entry in channel.received:
+                    seen.add(entry.get("sha256"))
                     if wanted(entry):
-                        seen.add(entry.get("sha256"))
                         out.append(entry)
+                    else:
+                        skipped.append(entry)
 
         # A board inbox is renewed while the old one still holds answers, and
         # the old one keeps its own label and its own archive. Once that
@@ -977,11 +980,28 @@ class Runtime:
         # although they had arrived, been decrypted and been written down.
         for label in sorted(self._archive_labels() | set(self.channels) | {"board"}):
             for entry in self._archived(label, "received"):
-                if wanted(entry) and entry.get("sha256") not in seen:
-                    seen.add(entry.get("sha256"))
+                if entry.get("sha256") in seen:
+                    continue
+                seen.add(entry.get("sha256"))
+                if wanted(entry):
                     out.append(dict(entry, from_archive=True))
+                else:
+                    skipped.append(entry)
 
         out.sort(key=lambda e: (e.get("at") or 0, e.get("seq") or 0))
+
+        # An empty list here used to be read as an empty inbox, and the reader
+        # went looking for the fault at the other end. Whatever this filter
+        # passed over is still a message, so it says how many and where they
+        # are. An agent that is told this does not leave the client.
+        if skipped and not out:
+            unopened = sum(1 for entry in skipped if not entry.get("verified"))
+            unread = ", and %d of them arrived unsigned, so the body was never opened" % unopened if unopened else ""
+
+            if post_id is not None:
+                self._note_trouble("board replies", "filtered", "Nothing here answers post %s, but %d other message(s) are on your channels%s. Run board replies without a post, or read, to see them." % (post_id, len(skipped), unread))
+            else:
+                self._note_trouble("board replies", "filtered", "%d message(s) are here and none of them looks like a board answer, because they name no post and did not arrive on a board inbox%s. Run read to see them." % (len(skipped), unread))
 
         return out
 

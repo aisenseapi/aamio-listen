@@ -142,3 +142,68 @@ def test_a_board_that_did_not_answer_is_not_a_post_that_does_not_exist():
 
     assert runtime.board_get("p" * 20) is None
 
+
+def bare_runtime(channels):
+    """A runtime with nothing but channels, the way board_replies is reached."""
+    import threading
+    from aamio.runtime import Runtime
+
+    runtime = object.__new__(Runtime)
+    runtime.channels = channels
+    runtime.lock = threading.Lock()
+    runtime.log = lambda *args: None
+    return runtime
+
+
+def test_no_replies_while_the_inbox_has_something_says_so():
+    """The empty list that sent an agent to hand roll nacl for an hour.
+
+    board replies filters, read does not. When the filter leaves the answer
+    empty and there was something to leave out, the caller hears it here
+    rather than concluding the other side went quiet.
+    """
+    from aamio.runtime import Channel
+
+    private = Channel("Arctic Freight", "r", "c" * 20, 2000000000)
+    private.received.append({"channel": "Arctic Freight", "at": 5, "verified": True, "sha256": "h1", "body": {"text": "an ordinary message"}})
+    runtime = bare_runtime({"Arctic Freight": private})
+
+    assert runtime.board_replies() == []
+
+    attention = runtime.attention_taken()
+    assert [(a["channel"], a["state"]) for a in attention] == [("board replies", "filtered")]
+    assert "1 message(s) are here" in attention[0]["what"] and "Run read" in attention[0]["what"]
+
+
+def test_an_unsigned_message_is_counted_as_never_opened():
+    """A sealed body with no signature has no sender key to open against, so
+    the note says the body was never read rather than leaving it at a count."""
+    from aamio.runtime import Channel
+
+    board = Channel("board", "r", "b" * 20, 2000000000)
+    board.received.append({"channel": "board", "at": 5, "verified": False, "sha256": "h2", "body": {"text": '{"e2ee":"nacl.box.v1"}'}})
+    runtime = bare_runtime({"board": board})
+
+    # It arrived on a board inbox, so it counts as an answer and nothing is noted.
+    assert len(runtime.board_replies()) == 1
+    assert runtime.attention_taken() == []
+
+    # Asked for one post, it answers none of them, and then the count matters.
+    assert runtime.board_replies("p1") == []
+    attention = runtime.attention_taken()
+    assert "arrived unsigned" in attention[0]["what"] and "p1" in attention[0]["what"]
+
+
+def test_answers_found_means_no_note():
+    """A caller that got what it asked for is not told about the rest of its
+    inbox. A note on every call is noise, and noise teaches readers to skip."""
+    from aamio.runtime import Channel
+
+    board = Channel("board", "r", "b" * 20, 2000000000)
+    board.received.append({"channel": "board", "at": 4, "verified": True, "sha256": "h3", "body": {"post": "p1", "text": "yes"}})
+    board.received.append({"channel": "board", "at": 5, "verified": True, "sha256": "h4", "body": {"text": "chatter"}})
+    runtime = bare_runtime({"board": board})
+
+    assert len(runtime.board_replies("p1")) == 1
+    assert runtime.attention_taken() == []
+
