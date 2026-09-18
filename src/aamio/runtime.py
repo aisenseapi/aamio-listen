@@ -185,27 +185,39 @@ class SendFailed(RuntimeError):
 
 
 class Channel:
-    def __init__(self, label, read_key, w, expire_at, allow=None, after=0):
+    def __init__(self, label, read_key, w, expire_at, allow=None, after=0, created_at=None):
         self.label = label
         self.read_key = read_key
         self.w = w
         self.expire_at = int(expire_at)
         self.allow = list(allow or [])
         self.after = int(after)
+        # Which thread at this address the cursor and the hashes belong to. A
+        # restart can take the thread and a write can open a new one at the
+        # same address, counting from one again, and created_at is the only
+        # thing that tells the two apart.
+        self.created_at = created_at
+        self.gone = False
         self.seen = set()
         self.received = []
         self.lock = threading.Lock()
         self.poller = None
         self.closed = False
 
+    def forget_thread(self):
+        """The cursor and the hashes belonged to a thread that is not there now."""
+        self.after = 0
+        self.seen = set()
+        self.created_at = None
+
     def to_state(self):
         # seen travels with the channel: without it a restart cannot tell a
         # redelivered message from a new one, and the model may act twice.
-        return {"label": self.label, "read_key": self.read_key, "w": self.w, "expire_at": self.expire_at, "allow": self.allow, "after": self.after, "seen": sorted(self.seen)}
+        return {"label": self.label, "read_key": self.read_key, "w": self.w, "expire_at": self.expire_at, "allow": self.allow, "after": self.after, "created_at": self.created_at, "seen": sorted(self.seen)}
 
     @classmethod
     def from_state(cls, item):
-        channel = cls(item["label"], item["read_key"], item["w"], item["expire_at"], item.get("allow"), item.get("after", 0))
+        channel = cls(item["label"], item["read_key"], item["w"], item["expire_at"], item.get("allow"), item.get("after", 0), item.get("created_at"))
         channel.seen = set(item.get("seen") or [])
 
         return channel
@@ -641,7 +653,11 @@ class Runtime:
 
     def ensure_inbox(self):
         inbox = self.channels.get("inbox")
-        if inbox and inbox.expire_at - time.time() > RENEW_BEFORE:
+        # A gone inbox is opened again at once. A write to the old address
+        # opens a thread there with none of this inbox's allowlist, so the
+        # partners are pointed at a new one that has it. The old address is
+        # still read until its time runs out, for whoever writes there anyway.
+        if inbox and inbox.expire_at - time.time() > RENEW_BEFORE and not inbox.gone:
             return inbox
         allow = [p["key"] for p in self.partners] if self.partners else None
         status, data, read_key, w = self.client.open_thread(INBOX_TTL, allow)
@@ -1519,6 +1535,32 @@ class Runtime:
         if status != 200:
             self._note(channel, "unread", "the service answered %s, so this channel was not read and there may be messages waiting" % status)
             return "error", []
+        # Three answers that used to read as a quiet inbox. No thread at the
+        # address: never written to, swept after expiry, or taken by a
+        # restart. A reset: the cursor was past everything the thread holds, so
+        # the service read from the start. And a created_at that is not the one
+        # this channel knew: a new thread at the same address whose count has
+        # already passed the old cursor, which the service cannot flag, since
+        # it does not know what this channel has seen. In all three the old
+        # cursor and the old hashes belong to another thread.
+        if data.get("exists") is False:
+            if not channel.gone:
+                self._note(channel, "gone", "there is no thread at this address any more. It expired and was swept, or the service restarted and it went with it. A write opens a new one here with the default lifetime and without the allowlist or gate this channel was opened with" + (", so a new inbox is opened for the partners" if channel.label == "inbox" else ""))
+            channel.gone = True
+            channel.forget_thread()
+            self.save_state()
+            return "gone", []
+        channel.gone = False
+        created = data.get("created_at")
+        reset = data.get("reset")
+        if channel.created_at is not None and created is not None and created != channel.created_at and not reset:
+            self._note(channel, "restarted", "the thread at this address is a new one, opened at %s where this channel knew one opened at %s, so it is read again from the start" % (created, channel.created_at))
+            channel.forget_thread()
+            return self.poll(channel, 0)
+        if reset:
+            self._note(channel, "restarted", (reset.get("what") if isinstance(reset, dict) else None) or "the service read this thread from the start")
+            channel.seen = set()
+        channel.created_at = created
         entries = []
         for message in data.get("messages", []):
             # sender is a name when we know the key and a label when we do
@@ -1573,6 +1615,13 @@ class Runtime:
             # the disk stayed full, and redeliver everything after it.
             channel.after = max(channel.after, entries[-1]["seq"])
             self.save_state()
+        # After a reset the service's next is the cursor, and it is lower than
+        # the one this channel held. Keeping the higher of the two would ask
+        # past the new thread on every call and hand the same messages over
+        # each time.
+        if reset and isinstance(data.get("next"), int):
+            channel.after = data["next"]
+            self.save_state()
         return "ok", entries
 
     def _poll_loop(self, channel):
@@ -1582,7 +1631,7 @@ class Runtime:
                 state, entries = self.poll(channel, 20)
                 if state == "expired":
                     break
-                if state == "error":
+                if state in ("error", "gone"):
                     time.sleep(2)
                 for entry in entries:
                     self.inbound.put(entry)
@@ -1638,8 +1687,9 @@ class Runtime:
                 state, entries = self.poll(channel, 0 if waited else wait)
                 # A channel that answered 410 or nothing at all used to eat the
                 # whole wait, so a read with wait 25 came back at once and the
-                # inbox was only ever asked with wait 0.
-                waited = waited or state == "ok"
+                # inbox was only ever asked with wait 0. A gone one did wait:
+                # the service holds a read of a missing thread for a write.
+                waited = waited or state in ("ok", "gone")
                 collected.extend(entries)
             if len(collected) > limit:
                 # The cursor has already moved past all of them. The surplus is
