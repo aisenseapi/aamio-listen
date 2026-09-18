@@ -68,7 +68,7 @@ def test_solve_gives_the_first_nonce_that_reaches_the_bits():
 
 
 def test_the_ceilings_are_the_services():
-    assert (POW_REQUIRE_MAX_BITS, POW_ADVISE_MAX_BITS) == (20, 18)
+    assert (POW_REQUIRE_MAX_BITS, POW_ADVISE_MAX_BITS) == (32, 18)
 
 
 # --------------------------------------------------------------------- plan --
@@ -83,14 +83,16 @@ def test_advised_work_at_the_ceiling_is_done_without_asking():
 
 
 def test_required_work_at_the_ceiling_is_done():
-    assert plan({"require": {"pow": {"bits": 20, "covers": 1}}}) == {"bits": 20, "required": True, "notes": []}
+    advice = plan({"require": {"pow": {"bits": 32, "covers": 1}}})
+    assert (advice["bits"], advice["required"], advice["notes"]) == (32, True, [])
+    assert advice["expected_seconds"] > 0 and advice["seconds_left"] is None
 
 
 def test_a_requirement_over_the_ceiling_stops_and_says_why():
     with pytest.raises(GateStop) as stop:
-        plan({"require": {"pow": {"bits": 21, "covers": 1}}})
+        plan({"require": {"pow": {"bits": 33, "covers": 1}}})
 
-    assert "21" in stop.value.reason and "20" in stop.value.reason
+    assert "33" in stop.value.reason and "32" in stop.value.reason
     assert stop.value.fix
 
 

@@ -20,7 +20,7 @@ import threading
 import time
 
 from .client import AamioClient, DEFAULT_HOST, is_scope_address, is_scope_key, make_scope_key, scope_address
-from .gate import GateStop, board_advised_bits, plan as gate_plan, solve as gate_solve, solve_board
+from .gate import GateStop, board_advised_bits, describe as describe_seconds, plan as gate_plan, solve as gate_solve, solve_board
 from .crypto import Keys, board_delete_signing_input, board_signing_input, is_envelope, is_key, key_hash, presence_signing_input, sha256hex, thread_signing_input, unb64url
 
 INBOX_TTL = 3600
@@ -267,6 +267,13 @@ class Runtime:
             if entry.get("status") == "sending":
                 entry["status"] = "unknown"
                 entry["note"] = "the process stopped while this was in flight"
+            # The proof of work comes before the post, so work that never
+            # finished was never sent. It used to stay working for good, with
+            # nothing working on it, and the outcome promised to the caller
+            # never came.
+            elif entry.get("status") == "working":
+                entry["status"] = "stopped"
+                entry["note"] = "the process stopped before its proof of work was done, so nothing was sent"
         self.presence_at = 0.0
         # What a read could not do, kept by channel and state until it is
         # handed to a caller. An empty read means nothing arrived. An empty
@@ -278,6 +285,15 @@ class Runtime:
         self.lock = threading.RLock()
         self.stop = threading.Event()
         self.listener = None
+        # Told once, on the first read after the restart, since the caller was
+        # promised how the send would end.
+        untold = [e for e in self.outbox.values() if e.get("status") == "stopped" and not e.get("told")]
+        for entry in untold:
+            self._note_trouble("send %s" % entry["id"], "stopped", "the message to %s was not sent: the process stopped before its proof of work was done. Send it again if it still matters." % entry.get("w"))
+            entry["told"] = True
+        if untold:
+            # So the next restart does not say it again.
+            self.save_outbox()
 
     # -------------------------------------------------------------- lock --
 
@@ -1185,7 +1201,7 @@ class Runtime:
         # What the inbox asks of writers is read before anything is stored, so
         # a requirement this client cannot meet stops here with its reason,
         # rather than as an outbox entry that can never be delivered.
-        gate_plan(self._gate_for(w), w, self.host)
+        advice = self._plan_for(w)
         inbox = self.ensure_inbox()
         body = {"from": self.keys.hash[:8], "reply_to": reply_to or inbox.w}
         if text is not None:
@@ -1198,6 +1214,27 @@ class Runtime:
         # same bytes. The recipient hashes those bytes, so a message that
         # lands twice is marked a replay there instead of acted on twice.
         entry = self._outbox_add(w, key, envelope, body)
+
+        # A caller with a time limit, a model on MCP whose host cuts a tool call
+        # after a minute or so, is not held for work that takes longer. The work
+        # goes on here, the answer comes at once, and how it ends is told on
+        # the next read, where it would otherwise be a call that timed out
+        # with nobody knowing whether the message went.
+        budget = getattr(self, "work_budget", None)
+        if budget is not None and advice.get("expected_seconds", 0) > budget:
+            entry["status"] = "working"
+            entry["work"] = {"bits": advice["bits"], "expected_seconds": int(advice["expected_seconds"]), "seconds_left": None if advice.get("seconds_left") is None else int(advice["seconds_left"])}
+            self.save_outbox()
+            threading.Thread(target=self._deliver_after_work, args=(entry, body, key, archived_data), daemon=True).start()
+            return {
+                "to": self.name_for_key(key) or key,
+                "w": w,
+                "message_id": entry["id"],
+                "status": "working",
+                "work": entry["work"],
+                "note": "This inbox asks for %d bits of proof of work, about %s here, so it is being done in the background and the message is sent when it is done. aamio_pending shows it until then, and the next aamio_read says how it ended." % (advice["bits"], describe_seconds(advice["expected_seconds"])),
+            }
+
         status, result = self._deliver(entry)
 
         if status in (404, 410) and partner is not None:
@@ -1210,7 +1247,10 @@ class Runtime:
 
         archived = body if archived_data is None else dict(body, data=archived_data)
         record = {"kind": "sent", "at": time.time(), "to": self.name_for_key(key) or key, "w": entry["w"], "status": status, "message_id": entry["id"], "outcome": entry["status"], "seq": (result or {}).get("seq") if isinstance(result, dict) else None, "sha256": (result or {}).get("sha256") if isinstance(result, dict) else None, "body": archived}
-        self.archive("sent", record)
+        # The archive is a record of the send, not the send. A full disk after
+        # a 201 raised here, and the caller heard an error for a message that
+        # was delivered, and might send it again as new bytes: a real duplicate.
+        archive_error = self._archive_sent(record)
 
         if status != 201:
             raise SendFailed(entry["status"], entry["id"], status, result)
@@ -1223,7 +1263,18 @@ class Runtime:
             sent["proof_id"] = result.get("proof_id")
         if entry.get("gate_notes"):
             sent["notes"] = entry["gate_notes"]
+        if archive_error is not None:
+            sent["archive_error"] = archive_error
         return sent
+
+    def _archive_sent(self, record):
+        """Write a sent record, and say what went wrong instead of raising it."""
+        try:
+            self.archive("sent", record)
+        except Exception as error:
+            self.log("archive sent %s: %s" % (record.get("message_id"), error))
+            return "%s: %s" % (error.__class__.__name__, error)
+        return None
 
 
     # ----------------------------------------------------------- outbox --
@@ -1266,8 +1317,12 @@ class Runtime:
         if w in gates:
             return gates[w]
 
+        left = None
         try:
-            status, data = self.client.gate(w)
+            if hasattr(self.client, "gate_timed"):
+                status, data, left = self.client.gate_timed(w)
+            else:
+                status, data = self.client.gate(w)
         except Exception:
             status, data = 0, None
 
@@ -1275,11 +1330,51 @@ class Runtime:
         # has opened yet, and it may be opened with a gate a moment later.
         if status == 200 and isinstance(data, dict):
             gates[w] = data
+            if left is not None:
+                self._gate_clock()[w] = (left, time.monotonic())
             return data
 
         return {}
 
-    def _post(self, w, body_text, notes):
+    def _forget_gate(self, w):
+        """The gate read for w, and the time it said, may belong to an inbox that is not there now."""
+        getattr(self, "gates", {}).pop(w, None)
+        self._gate_clock().pop(w, None)
+
+    def _plan_for(self, w):
+        """What the gate of w asks, read again once before a no that rests on a gate read earlier.
+
+        A gate never changes while its thread lives, which is why it is kept.
+        But an address can have more than one life. The time a kept gate said
+        counted down to nothing and stayed there, and a new inbox at the same
+        address, with no gate at all, was refused on the old one's terms
+        without the service ever being asked. One more read, only when the
+        answer would be no, is what that costs.
+        """
+        cached = w in getattr(self, "gates", {})
+        try:
+            return gate_plan(self._gate_for(w), w, self.host, self._seconds_left(w))
+        except GateStop:
+            if not cached:
+                raise
+            self._forget_gate(w)
+            return gate_plan(self._gate_for(w), w, self.host, self._seconds_left(w))
+
+    def _gate_clock(self):
+        clock = getattr(self, "gate_clock", None)
+        if clock is None:
+            clock = self.gate_clock = {}
+        return clock
+
+    def _seconds_left(self, w):
+        """How long w still takes writes, counted down from what its gate said, or None."""
+        said = self._gate_clock().get(w)
+        if said is None:
+            return None
+        left, at = said
+        return max(0, left - (time.monotonic() - at))
+
+    def _post(self, w, body_text, notes, entry=None):
         """POST to an inbox with the work its gate asks for, answering a 428 once.
 
         Never more than one more attempt. Each costs a place in the rate window,
@@ -1289,25 +1384,50 @@ class Runtime:
         the caller should hear although the message went out.
         """
         signature = self.keys.sign(thread_signing_input(w, body_text))
-        advice = gate_plan(self._gate_for(w), w, self.host)
+        advice = self._plan_for(w)
         notes.extend(advice["notes"])
-        status, result = self._post_with_work(w, body_text, signature, advice["bits"])
+        status, result = self._post_with_work(w, body_text, signature, advice["bits"], self._seconds_left(w), entry)
 
         if status == 428 and isinstance(result, dict) and isinstance(result.get("gate"), dict):
             self.gates[w] = result["gate"]
-            asked = gate_plan(result["gate"], w, self.host)
+            left = result.get("seconds_left") if isinstance(result.get("seconds_left"), int) else None
+            if left is not None:
+                self._gate_clock()[w] = (left, time.monotonic())
+            asked = gate_plan(result["gate"], w, self.host, left)
             notes.extend(note for note in asked["notes"] if note not in notes)
 
             if asked["bits"] and asked["bits"] != advice["bits"]:
-                status, result = self._post_with_work(w, body_text, signature, asked["bits"])
+                status, result = self._post_with_work(w, body_text, signature, asked["bits"], left, entry)
 
         return status, result
 
-    def _post_with_work(self, w, body_text, signature, bits):
+    def _post_with_work(self, w, body_text, signature, bits, seconds_left=None, entry=None):
         if not bits:
             return self.client.post(w, body_text, self.keys.public, signature)
 
-        return self.client.post(w, body_text, self.keys.public, signature, "text/plain", gate_solve(w, self.keys.public, body_text, bits))
+        # While the work runs nothing has been sent, and the entry says so, so
+        # a process that stops here leaves a message it knows was not sent
+        # rather than one whose fate is unknown.
+        if entry is not None:
+            entry["status"] = "working"
+            self.save_outbox()
+
+        # The work stops when the inbox would close, less a few seconds for the
+        # post itself: past that point a nonce buys nothing but a 410.
+        deadline = None if seconds_left is None else time.monotonic() + max(0, seconds_left - 5)
+        nonce = gate_solve(w, self.keys.public, body_text, bits, deadline)
+
+        if entry is not None:
+            entry["status"] = "sending"
+            self.save_outbox()
+
+        if nonce is None:
+            raise GateStop(
+                "The proof of work of %d bits was not done before the inbox stops taking writes, so the work was stopped and nothing was sent." % bits,
+                "The estimate before it started said it would fit, and this time it took longer, which happens: the work is a lottery. Ask the owner for a longer inbox, or send from a machine with more compute.",
+            )
+
+        return self.client.post(w, body_text, self.keys.public, signature, "text/plain", nonce)
 
     # ----------------------------------------------------------- deliver --
 
@@ -1319,7 +1439,7 @@ class Runtime:
         notes = []
 
         try:
-            status, result = self._post(entry["w"], entry["envelope"], notes)
+            status, result = self._post(entry["w"], entry["envelope"], notes, entry)
         except GateStop as stop:
             # Nothing left this machine and nothing will: the entry is refused,
             # not pending, and says why.
@@ -1333,6 +1453,11 @@ class Runtime:
             entry["gate_notes"] = notes
         entry["last_status"] = status
         entry["last_at"] = int(time.time())
+
+        # An inbox that is not there, or has expired, takes its gate with it:
+        # the next send to this address reads the gate of whatever is there then.
+        if status in (404, 410):
+            self._forget_gate(entry["w"])
 
         if status == 201:
             entry["status"] = "delivered"
@@ -1350,8 +1475,36 @@ class Runtime:
         return status, result
 
     def outbox_pending(self):
-        """Messages whose fate is not settled: in flight, or unknown after a stop."""
-        return [dict(e) for e in self.outbox.values() if e["status"] in ("sending", "unknown")]
+        """Messages whose fate is not settled: working, in flight, or unknown after a stop."""
+        return [dict(e) for e in self.outbox.values() if e["status"] in ("working", "sending", "unknown")]
+
+    def _deliver_after_work(self, entry, body, key, archived_data=None):
+        """The background half of a send whose work was too long to wait for.
+
+        Every way it can end is told on the next read, since the caller was
+        answered long before, and an outcome nobody hears about is a message
+        that silently did or did not go.
+        """
+        where = "send %s" % entry["id"]
+        try:
+            status, result = self._deliver(entry)
+        except GateStop as stop:
+            self._note_trouble(where, "refused", "the message to %s was not sent: %s" % (self.name_for_key(key) or entry["w"], stop.reason))
+            return
+        except Exception as error:
+            self._note_trouble(where, "unknown", "the message to %s may or may not have been sent: %s. aamio_pending shows it." % (self.name_for_key(key) or entry["w"], error.__class__.__name__))
+            return
+
+        archived = body if archived_data is None else dict(body, data=archived_data)
+        # A failed archive write is said beside the outcome, never instead of
+        # it: it used to raise here and take the promised note with it.
+        archive_error = self._archive_sent({"kind": "sent", "at": time.time(), "to": self.name_for_key(key) or key, "w": entry["w"], "status": status, "message_id": entry["id"], "outcome": entry["status"], "seq": (result or {}).get("seq") if isinstance(result, dict) else None, "sha256": (result or {}).get("sha256") if isinstance(result, dict) else None, "body": archived})
+        tail = "" if archive_error is None else ". It could not be written to the sent archive (%s), which changes nothing about the delivery" % archive_error
+
+        if status == 201:
+            self._note_trouble(where, "delivered", "the message to %s, which needed %d bits of proof of work, was delivered as seq %s%s" % (self.name_for_key(key) or entry["w"], (entry.get("work") or {}).get("bits") or 0, (result or {}).get("seq"), tail))
+        else:
+            self._note_trouble(where, entry["status"], "the message to %s ended %s after its proof of work, http %s%s" % (self.name_for_key(key) or entry["w"], entry["status"], status, tail))
 
     def outbox_retry(self, message_id=None):
         """Send the same bytes again for entries that never got a clear answer.

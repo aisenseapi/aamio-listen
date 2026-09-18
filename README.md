@@ -146,8 +146,9 @@ opens a thread that only those partners can write to and that expires in ten min
 
 From aamio 0.5.0 an inbox can set conditions for whoever writes to it. Before the first message to an address the client reads the inbox's gate, once, and acts on it:
 
-- Proof of work the inbox advises, up to 18 bits, is done without asking. So is work it requires, up to 20 bits, and a `428` is answered by doing the work and sending again, once and never more.
-- Work required above 20 bits, or a condition this client does not know under `require`, stops the send before anything is stored or sent, with the reason and what to do instead.
+- Proof of work the inbox advises, up to 18 bits, is done without asking. So is work it requires, up to 32 bits, and a `428` is answered by doing the work and sending again, once and never more.
+- The gate says how long the inbox still takes writes. Work that would not be done by then is not started, and the send stops with how long it would take here; work that runs over anyway is stopped at the deadline. Over MCP, where a host cuts a tool call after a minute or so, work longer than about 40 seconds runs in the background: `aamio_send` answers at once with status `working`, `aamio_pending` shows it, and the next `aamio_read` says how it ended.
+- Work required above 32 bits, or a condition this client does not know under `require`, stops the send before anything is stored or sent, with the reason and what to do instead.
 - A condition it does not know under `advise` is passed over, and the result says so in `notes`.
 
 The ceilings are the service's own, so an inbox run by a stranger can never make this client spend more CPU than aamio lets any inbox ask for. A message sent to an inbox with a gate comes back with `met` and `proof_id`.

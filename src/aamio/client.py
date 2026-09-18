@@ -77,7 +77,8 @@ class AamioClient:
         self.board = (board or os.environ.get("AAMIO_BOARD") or DEFAULT_BOARD).rstrip("/")
         self.verifyum = (verifyum or os.environ.get("AAMIO_VERIFYUM") or VERIFYUM_MCP).rstrip("/")
 
-    def http(self, method: str, url: str, body=None, headers=None, timeout=None):
+    def http(self, method: str, url: str, body=None, headers=None, timeout=None, with_headers=False):
+        """(status, body), or (status, body, headers) with with_headers."""
         data = None
         if body is not None:
             data = body.encode("utf-8") if isinstance(body, str) else json.dumps(body).encode("utf-8")
@@ -93,20 +94,25 @@ class AamioClient:
             request.add_header("Content-Type", "application/json")
         for name, value in (headers or {}).items():
             request.add_header(name, value)
+        got = {}
         try:
             with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
                 status, text = response.status, response.read().decode("utf-8")
+                got = {name.lower(): value for name, value in response.headers.items()}
         except urllib.error.HTTPError as error:
             status, text = error.code, error.read().decode("utf-8", "replace")
+            got = {name.lower(): value for name, value in (error.headers.items() if error.headers else [])}
         except Exception as error:
             # No reply at all: connection refused, timeout, DNS, a dropped
             # socket after the bytes went out. Whether the service saw the
             # request is unknown, and status 0 says exactly that.
-            return 0, {"error": "no response", "detail": error.__class__.__name__}
+            answer = (0, {"error": "no response", "detail": error.__class__.__name__})
+            return answer + ({},) if with_headers else answer
         try:
-            return status, (json.loads(text) if text else None)
+            parsed = json.loads(text) if text else None
         except ValueError:
-            return status, text
+            parsed = text
+        return (status, parsed, got) if with_headers else (status, parsed)
 
     def call(self, method: str, path: str, body=None, headers=None, timeout=None):
         return self.http(method, self.host + path, body, headers, timeout)
@@ -132,6 +138,20 @@ class AamioClient:
     def gate(self, w: str):
         """GET /{w}/gate: what an inbox asks of whoever writes to it. No key needed."""
         return self.call("GET", "/%s/gate" % w)
+
+    def gate_timed(self, w: str):
+        """GET /{w}/gate, with the seconds the inbox still takes writes.
+
+        (status, gate, seconds_left), seconds_left from X-Seconds-Left and None
+        from a service that does not send it. It is a header because the body
+        is the exact bytes the gate hash is taken over.
+        """
+        status, data, headers = self.http("GET", self.host + "/%s/gate" % w, with_headers=True)
+        try:
+            left = int(headers.get("x-seconds-left"))
+        except (TypeError, ValueError):
+            left = None
+        return status, data, left
 
     def read(self, w: str, read_key: str, after: int = 0, wait: int = 0):
         path = "/%s/after/%d" % (w, int(after))

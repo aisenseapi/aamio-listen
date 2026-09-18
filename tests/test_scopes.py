@@ -84,7 +84,7 @@ def sending(home):
     runtime.gates = {}
     runtime.client = SimpleNamespace(gate=lambda w: (404, None))
     runtime.address_for = lambda name: ("a" * 20, runtime.partner_by_name(name)["key"])
-    runtime._post = lambda w, envelope, notes: (201, {"seq": 1, "at": 1, "sha256": "s" * 64, "expire_at": 2})
+    runtime._post = lambda w, envelope, notes, entry=None: (201, {"seq": 1, "at": 1, "sha256": "s" * 64, "expire_at": 2})
 
     return runtime
 
@@ -216,7 +216,7 @@ def test_a_post_in_a_scope_is_answered_through_the_scope(home):
     runtime.scope_add("team", key=VECTOR_KEY)
     post = {"id": "p" * 20, "w": "w" * 20, "key": "their-key", "expire_at": int(time.time()) + 600}
     runtime.client = SimpleNamespace(board_find=lambda body, wait: (200, {"count": 1, "live": 1, "next": 1, "posts": [post], "scope": VECTOR_ADDRESS}), board_get=lambda post_id: (404, {"error": "No live post with this id"}))
-    runtime._post = lambda w, envelope, notes: (201, {"seq": 1, "at": 1})
+    runtime._post = lambda w, envelope, notes, entry=None: (201, {"seq": 1, "at": 1})
 
     assert runtime.board_answer("p" * 20, "I can read it tonight", scope="team")["post"] == "p" * 20
 
@@ -233,7 +233,7 @@ def test_an_answer_in_a_scope_finds_its_post_past_the_first_page(home):
         200: {"count": 1, "live": 201, "next": 201, "posts": [wanted], "scope": VECTOR_ADDRESS},
     }
     runtime.client = SimpleNamespace(board_find=lambda body, wait: (200, pages[body["after"]]), board_get=lambda post_id: (404, {}))
-    runtime._post = lambda w, envelope, notes: (201, {"seq": 1, "at": 1})
+    runtime._post = lambda w, envelope, notes, entry=None: (201, {"seq": 1, "at": 1})
 
     assert runtime.board_answer("q" * 20, "Found it on the second page", scope="team")["post"] == "q" * 20
 
