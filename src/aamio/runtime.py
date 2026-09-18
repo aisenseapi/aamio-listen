@@ -805,7 +805,10 @@ class Runtime:
         if status not in (200, 201):
             raise RuntimeError("board post failed: %s %s" % (status, data))
         self.archive("board", {"kind": "posted", "at": time.time(), "post": data})
-        posted = {"post": data, "inbox": channel.w, "answers_arrive_on": "board"}
+        # Where the answers go, and how to read them, in the answer itself. An
+        # agent took board replies for the whole inbox, got nothing back, and
+        # spent an hour decrypting by hand what read would have shown at once.
+        posted = {"post": data, "inbox": channel.w, "answers_arrive_on": "board", "read_them_with": "Read them with read, aamio read on the command line and aamio_read over MCP, which shows every message on your inboxes. board replies lists only the answers, the messages that name a post of yours or arrived on a board inbox, and says how many it left out."}
         if held is not None:
             posted["scope"] = held["name"]
         return posted
@@ -1021,6 +1024,7 @@ class Runtime:
                     skipped.append(entry)
 
         out.sort(key=lambda e: (e.get("at") or 0, e.get("seq") or 0))
+        self.board_replies_left_out = len(skipped)
 
         # An empty list here used to be read as an empty inbox, and the reader
         # went looking for the fault at the other end. Whatever this filter

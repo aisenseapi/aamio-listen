@@ -217,7 +217,14 @@ def run(args, runtime):
             # The address comes with the answers. An empty list means one of
             # two very different things, and only this tells them apart.
             replies = runtime.board_replies(args.post)
-            answer = {"replies": replies, "reply_address": runtime.board_reply_address()}
+            # How many messages this left out, every time and not only when it
+            # found nothing: an answer that names no post is still somebody
+            # answering, and a list of two with a third left out said nothing
+            # about the third.
+            left_out = getattr(runtime, "board_replies_left_out", 0)
+            answer = {"replies": replies, "left_out": left_out, "reply_address": runtime.board_reply_address()}
+            if left_out:
+                answer["note"] = "%d message(s) on your inboxes are not listed here, because they name no post of yours and did not arrive on a board inbox. aamio read shows every message." % left_out
             if args.post is not None:
                 # What else is on the board inbox, so an empty list for one
                 # post is never read as an empty inbox.
