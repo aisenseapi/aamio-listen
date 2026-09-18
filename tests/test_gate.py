@@ -3,11 +3,14 @@
 Checked against the vectors the service and the JS client share, and against a
 runtime whose network is a fake that answers as told and records what was sent.
 
-The rules come from the gate specification, 16 September 2026:
+The rules come from the gate specification, 16 September 2026, with the
+ceiling for required work raised from 20 to 32 bits on 18 September:
 
 - advised work at 18 bits or fewer is done without asking;
-- required work at 20 bits or fewer is done, and a 428 is answered once;
-- a requirement over the ceiling stops, and says why;
+- required work at 32 bits or fewer is done when it fits in the time the inbox
+  still takes writes, and a 428 is answered once;
+- a requirement over the ceiling stops, and says why, and so does work that
+  would not be done in time, which test_heavy_work.py checks;
 - an unknown condition stops under require and is passed over under advise;
 - never more than one more attempt after a 428.
 """
