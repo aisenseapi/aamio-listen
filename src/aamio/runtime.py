@@ -21,7 +21,7 @@ import time
 
 from .client import AamioClient, DEFAULT_HOST, is_scope_address, is_scope_key, make_scope_key, scope_address
 from .gate import GateStop, board_advised_bits, describe as describe_seconds, plan as gate_plan, solve as gate_solve, solve_board
-from .crypto import Keys, board_delete_signing_input, board_signing_input, is_envelope, is_key, key_hash, presence_signing_input, sha256hex, thread_signing_input, unb64url
+from .crypto import Keys, board_delete_signing_input, board_signing_input, check_message, is_envelope, is_key, key_hash, presence_signing_input, sha256hex, thread_signing_input, unb64url
 
 INBOX_TTL = 3600
 # The board's own default, mirrored here so an ordinary post gets the same
@@ -205,9 +205,15 @@ class Channel:
         self.closed = False
 
     def forget_thread(self):
-        """The cursor and the hashes belonged to a thread that is not there now."""
+        """The cursor belonged to a thread that is not there now. The hashes stay.
+
+        They are what this reader has been handed, whichever thread carried it.
+        They used to be cleared here with the cursor, and that lost the replay
+        mark at the one moment it is most needed: after the service loses its
+        store, every sender whose message went with it sends the same bytes
+        again, and a reader that had already acted on them acted twice.
+        """
         self.after = 0
-        self.seen = set()
         self.created_at = None
 
     def to_state(self):
@@ -1716,10 +1722,29 @@ class Runtime:
             return self.poll(channel, 0)
         if reset:
             self._note(channel, "restarted", (reset.get("what") if isinstance(reset, dict) else None) or "the service read this thread from the start")
-            channel.seen = set()
         channel.created_at = created
         entries = []
+        kept_out = []
+        last_seq = None
         for message in data.get("messages", []):
+            last_seq = message["seq"] if last_seq is None else max(last_seq, message["seq"])
+            # What the service says about a message is the service's word. The
+            # hash and the signature are checked here, and everything below
+            # goes by that: whose message it is, whether it is opened, and
+            # whether this channel takes it at all.
+            verified, why_not, digest = check_message(channel.w, message)
+            sender_key = message.get("from") if verified else None
+            if why_not is not None and message.get("verified"):
+                self._note(channel, "unverified", "message %s on this channel was called verified by the service and does not check out here: %s. It is handed over as unverified. That is a fault in the service or an operator that lies, and whoever runs it should hear of it." % (message["seq"], why_not))
+            # The allowlist is this channel's too. The service enforces it for
+            # as long as it holds the thread, and it holds it in memory: when
+            # the store is emptied, a write to the address opens a thread with
+            # no list at all. What the channel was opened for is kept with its
+            # read key, and applied to what it reads.
+            if channel.allow and not (verified and (channel.allow == ["*"] or sender_key in channel.allow)):
+                kept_out.append(message["seq"])
+                continue
+            message = dict(message, verified=verified, sha256=digest or message.get("sha256"), **{"from": sender_key})
             # sender is a name when we know the key and a label when we do
             # not, which reads well and answers the wrong question. Whether a
             # signature checked out, which key made it, and whether that key is
@@ -1728,6 +1753,8 @@ class Runtime:
             # a contact can still send something not to be trusted.
             known = self.name_for_key(message["from"])
             entry = {"channel": channel.label, "seq": message["seq"], "at": message["at"], "verified": message["verified"], "from_key": message["from"], "known_contact": known is not None, "sender": known or ("unknown key" if message["from"] else "unsigned"), "sha256": message["sha256"], "replay": message["sha256"] in channel.seen}
+            if why_not is not None:
+                entry["unverified_because"] = why_not
             channel.seen.add(message["sha256"])
             try:
                 body, meta = self._open(message)
@@ -1772,6 +1799,14 @@ class Runtime:
             # the disk stayed full, and redeliver everything after it.
             channel.after = max(channel.after, entries[-1]["seq"])
             self.save_state()
+        if kept_out:
+            # Past them as well, or the same messages are read and kept out on
+            # every call. And said, since a message that does not arrive has to
+            # be told from one that was never sent.
+            channel.after = max(channel.after, last_seq)
+            self.save_state()
+            opened_for = "any key, signed only" if channel.allow == ["*"] else "%d named key(s)" % len(channel.allow)
+            self._note(channel, "kept_out", "%d message(s) were kept out of this channel (seq %s%s): it was opened for %s, and these were not signed by a key it allows, as checked here. The service enforces the list while it holds the thread; a thread written to after the service lost its store has none, which is how they got this far. They are not handed over and not archived." % (len(kept_out), ", ".join(str(seq) for seq in kept_out[:10]), " and more" if len(kept_out) > 10 else "", opened_for))
         # After a reset the service's next is the cursor, and it is lower than
         # the one this channel held. Keeping the higher of the two would ask
         # past the new thread on every call and hand the same messages over

@@ -26,6 +26,10 @@ sys.path.insert(0, "src")
 
 from aamio.mcp_server import TOOLS, dispatch
 from aamio.runtime import Channel, Runtime, SendFailed
+from signing import keypair, stored
+
+# Three identities with real keys, since a reader verifies the signature itself.
+KEYS = {"known-key": keypair(1), "stranger-one": keypair(2), "stranger-two": keypair(3)}
 
 BY_NAME = {tool["name"]: tool for tool in TOOLS}
 
@@ -36,8 +40,8 @@ def runtime_holding(messages):
     runtime.channels = {"inbox": channel}
     runtime.lock = threading.RLock()
     runtime.peers = {}
-    runtime.partners = [{"name": "builder", "key": "known-key"}]
-    runtime.name_for_key = lambda key: "builder" if key == "known-key" else None
+    runtime.partners = [{"name": "builder", "key": KEYS["known-key"].public}]
+    runtime.name_for_key = lambda key: "builder" if key == KEYS["known-key"].public else None
     runtime.save_state = lambda: None
     runtime.log = lambda text: None
     runtime.archive = lambda label, record: None
@@ -48,14 +52,7 @@ def runtime_holding(messages):
 
 
 def message(seq, key, body):
-    return {
-        "seq": seq,
-        "at": 1700000000 + seq,
-        "verified": True,
-        "from": key,
-        "sha256": "%064d" % seq,
-        "body": body,
-    }
+    return stored("w" * 20, seq, body, KEYS[key], at=1700000000 + seq)
 
 
 def test_two_strangers_are_two_identities():
@@ -90,7 +87,7 @@ def test_the_public_key_survives_the_read_tool():
     runtime.read = lambda wait: runtime.poll(runtime.channels["inbox"])[1]
     out = dispatch(runtime, "aamio_read", {})
 
-    assert out["structuredContent"]["messages"][0]["from_key"] == "stranger-one"
+    assert out["structuredContent"]["messages"][0]["from_key"] == KEYS["stranger-one"].public
 
 
 def refused_send(outcome):

@@ -14,6 +14,7 @@ default lifetime and none of the old allowlist. Three things went quiet:
     on every call, and would have handed the same messages over each time.
 """
 
+import hashlib
 import sys
 import threading
 import time
@@ -48,8 +49,11 @@ def build(answers, label="inbox"):
     return runtime
 
 
-def message(seq, body="hello"):
-    return {"seq": seq, "at": seq, "verified": False, "from": None, "sha256": "h%d-%s" % (seq, body), "body": body}
+def message(seq, body=None):
+    # The hash is the body's own, as the service gives it: the reader computes
+    # it too, and marks a replay by it, so each message says something else.
+    body = "hello %d" % seq if body is None else body
+    return {"seq": seq, "at": seq, "verified": False, "from": None, "sig": None, "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(), "body": body}
 
 
 def test_a_thread_that_is_gone_is_said_once_and_the_cursor_goes_back_to_zero():
@@ -72,7 +76,9 @@ def test_a_thread_that_is_gone_is_said_once_and_the_cursor_goes_back_to_zero():
     assert "new inbox is opened" in first[0]["what"]
     # Said when it happens, not on every read after that.
     assert second == []
-    assert channel.after == 0 and channel.seen == set() and channel.created_at is None
+    # The cursor goes back. The hashes stay: they are what this reader was
+    # handed, whichever thread carried it.
+    assert channel.after == 0 and channel.seen == {"old"} and channel.created_at is None
     assert channel.gone
 
 

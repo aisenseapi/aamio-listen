@@ -20,12 +20,13 @@ from types import SimpleNamespace
 sys.path.insert(0, "src")
 
 from aamio.runtime import Channel, Runtime
+from signing import SENDER, stored
 
 CANONICAL = {"post": "p1", "reply_to": "r" * 20, "text": "use a 5 minute debounce"}
 GUESSED = {"post_id": "p1", "w": "r" * 20, "reply": "use a 5 minute debounce"}
 
 
-def deliver(body, verified=True, sender="a-verified-key", sealed_to=None):
+def deliver(body, verified=True, sender=SENDER, sealed_to=None):
     """One message through poll(), with nothing touching disk or the network."""
     runtime = object.__new__(Runtime)
     channel = Channel("board", "read-key", "b" * 20, 2000000000)
@@ -38,14 +39,7 @@ def deliver(body, verified=True, sender="a-verified-key", sealed_to=None):
     runtime.log = lambda *args: None
     if sealed_to is not None:
         runtime.keys = SimpleNamespace(open=lambda frm, text: json.dumps(sealed_to).encode("utf-8"))
-    message = {
-        "verified": verified,
-        "from": sender if verified else None,
-        "body": body,
-        "seq": 1,
-        "at": 1800000000,
-        "sha256": "hash-1",
-    }
+    message = stored(channel.w, 1, body, sender if verified else None, at=1800000000)
     runtime.client = SimpleNamespace(read=lambda *args: (200, {"messages": [message]}))
     status, entries = runtime.poll(channel)
     assert status == "ok"
@@ -59,7 +53,7 @@ def test_plaintext_json_with_guessed_names_reaches_its_post():
     assert entry["renamed"] == {"post_id": "post", "w": "reply_to", "reply": "text"}
     # The three things that were broken, seen from where a caller stands.
     assert len(runtime.board_replies("p1")) == 1
-    assert runtime.peers["r" * 20] == "a-verified-key"
+    assert runtime.peers["r" * 20] == SENDER.public
 
 
 def test_plaintext_json_with_the_documented_names_is_untouched():
@@ -93,7 +87,7 @@ def test_a_sealed_message_that_will_not_open_says_so_without_pretending():
         raise ValueError("not for this key")
 
     runtime.keys = SimpleNamespace(open=refuse)
-    message = {"verified": True, "from": "k", "body": envelope, "seq": 1, "at": 1, "sha256": "h"}
+    message = stored(channel.w, 1, envelope)
     runtime.client = SimpleNamespace(read=lambda *args: (200, {"messages": [message]}))
     entry = runtime.poll(channel)[1][0]
     assert entry["format"] == "unreadable" and entry["encrypted"] and entry["error"] == "ValueError"
@@ -186,8 +180,8 @@ def test_one_undecodable_message_does_not_cost_the_others():
     runtime.save_state = lambda: None
     runtime.log = lambda *args: None
     messages = [
-        {"verified": True, "from": "k", "body": json.dumps({"post": "p1", "text": {"toString": 1}, "reply": "hi"}), "seq": 1, "at": 1, "sha256": "h1"},
-        {"verified": True, "from": "k", "body": json.dumps({"post": "p1", "text": "an ordinary answer"}), "seq": 2, "at": 2, "sha256": "h2"},
+        stored(channel.w, 1, json.dumps({"post": "p1", "text": {"toString": 1}, "reply": "hi"})),
+        stored(channel.w, 2, json.dumps({"post": "p1", "text": "an ordinary answer"})),
     ]
     runtime.client = SimpleNamespace(read=lambda *args: (200, {"messages": messages}))
     status, entries = runtime.poll(channel)

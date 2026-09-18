@@ -18,6 +18,7 @@ sys.path.insert(0, "src")
 
 from aamio.mcp_server import dispatch
 from aamio.runtime import Channel, Runtime
+from signing import stored
 
 
 def build(answers):
@@ -97,7 +98,7 @@ def test_the_model_is_told_over_mcp_as_well():
 def test_a_read_that_hands_over_less_than_it_took_says_so():
     """poll moves the cursor and saves it before the caller sees a message, so
     whatever read cuts off the end is past the cursor and will not come back."""
-    many = [{"seq": n, "at": n, "verified": True, "from": "k", "sha256": "%064d" % n, "body": "{}"} for n in range(1, 61)]
+    many = [stored("i" * 20, n, '{"n":%d}' % n) for n in range(1, 61)]
     runtime = build([(200, {"messages": many})])
     runtime._open = lambda message: ({"text": "x"}, {"signed": True, "encrypted": False, "format": "json"})
     got = runtime.read(limit=50)

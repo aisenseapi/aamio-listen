@@ -32,6 +32,11 @@ from aamio.crypto import board_signing_input, key_hash
 from aamio.client import is_scope_address, is_scope_key, make_scope_key, scope_address, write_address
 from aamio.mcp_server import INSTRUCTIONS, TOOLS, dispatch, safely
 from aamio.runtime import Channel, Runtime
+from signing import keypair, stored
+
+# A partner with a real key, for the reads that go through poll: the reader
+# verifies the signature itself, and a share is only taken from a partner.
+PARTNER = keypair(4)
 
 VECTOR_KEY = "aamioscopevector0000000000"
 VECTOR_ADDRESS = "2o3wek6doqhqatib63vj"
@@ -357,8 +362,9 @@ def test_a_key_in_aamio_scope_is_taken_out_whatever_its_shape_and_wherever_it_si
 
 def test_the_key_is_gone_before_the_message_is_archived(home):
     runtime = build(home)
+    runtime.partners = [{"name": "alice", "key": PARTNER.public}]
     channel = Channel("inbox", "read", "i" * 20, time.time() + 600)
-    runtime.client = SimpleNamespace(read=lambda w, read_key, after, wait: (200, {"messages": [{"seq": 1, "at": 1, "verified": True, "from": ALICE, "sha256": "s" * 64, "body": "sealed"}]}))
+    runtime.client = SimpleNamespace(read=lambda w, read_key, after, wait: (200, {"messages": [stored("i" * 20, 1, "sealed", PARTNER)]}))
     runtime._open = lambda message: ({"from": "abcd1234", "text": "Scope team", "data": {"aamio_scope": {"name": "team", "key": VECTOR_KEY}}}, {"signed": True, "encrypted": True, "format": "json"})
 
     state, entries = runtime.poll(channel)
@@ -370,8 +376,9 @@ def test_the_key_is_gone_before_the_message_is_archived(home):
 
 def test_a_share_that_cannot_be_saved_is_not_kept_and_the_rest_of_the_batch_arrives(home):
     runtime = build(home)
+    runtime.partners = [{"name": "alice", "key": PARTNER.public}]
     channel = Channel("inbox", "read", "i" * 20, time.time() + 600)
-    runtime.client = SimpleNamespace(read=lambda w, read_key, after, wait: (200, {"messages": [{"seq": n, "at": n, "verified": True, "from": ALICE, "sha256": "%064d" % n, "body": "sealed"} for n in (1, 2)]}))
+    runtime.client = SimpleNamespace(read=lambda w, read_key, after, wait: (200, {"messages": [stored("i" * 20, n, "sealed %d" % n, PARTNER) for n in (1, 2)]}))
     bodies = {1: {"text": "Scope team", "data": {"aamio_scope": {"name": "team", "key": VECTOR_KEY}}}, 2: {"text": "and the next message"}}
     runtime._open = lambda message: (bodies[message["seq"]], {"signed": True, "encrypted": True, "format": "json"})
 

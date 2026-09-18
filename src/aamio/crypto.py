@@ -109,6 +109,49 @@ class Keys:
         return Box(self.curve, self.curve_public(sender_key)).decrypt(unb64url(envelope["ct"]), unb64url(envelope["nonce"]))
 
 
+def verify(key_b64url: str, message: str, signature_b64url: str) -> bool:
+    """Whether the signature is that key's over the UTF-8 bytes of message. False for anything malformed, never an exception."""
+    try:
+        VerifyKey(unb64url(key_b64url)).verify(message.encode("utf-8"), unb64url(signature_b64url))
+        return True
+    except Exception:
+        return False
+
+
+def check_message(w: str, message: dict):
+    """(verified, why_not, sha256) for one message as the service returned it, checked here.
+
+    `verified` in an answer is the service's word, and the trust model says an
+    operator cannot forge a signature. That is only true for a reader who
+    checks: so the body is hashed here, the hash compared with the one beside
+    it, and the signature verified over the address being read. why_not is None
+    for a message that verified and for an ordinary unsigned one, and a sentence
+    when something that should have held did not.
+    """
+    body = message.get("body")
+
+    if not isinstance(body, str):
+        return False, "the message has no body to check", None
+
+    digest = sha256hex(body)
+
+    if message.get("sha256") != digest:
+        return False, "the body does not hash to the sha256 the service gave with it, so these are not the bytes that were stored", digest
+
+    sender, signature = message.get("from"), message.get("sig")
+
+    if not sender or not signature:
+        if message.get("verified"):
+            return False, "the service calls it verified and gave no key or signature to check", digest
+
+        return False, None, digest
+
+    if verify(sender, thread_signing_input(w, body), signature):
+        return True, None, digest
+
+    return False, "the signature does not check out for this key, this address and these bytes" + (", though the service said it did" if message.get("verified") else ""), digest
+
+
 def is_envelope(text: str) -> bool:
     try:
         envelope = json.loads(text)

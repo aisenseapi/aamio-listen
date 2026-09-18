@@ -27,6 +27,7 @@ import pytest
 sys.path.insert(0, "src")
 
 from aamio.runtime import Channel, Runtime
+from signing import stored
 
 
 @pytest.fixture
@@ -70,17 +71,7 @@ def build(home, sealed=None):
 
 
 def deliver(runtime, channel, bodies):
-    messages = [
-        {
-            "seq": seq,
-            "at": seq,
-            "verified": True,
-            "from": "a-verified-key",
-            "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
-            "body": body,
-        }
-        for seq, body in enumerate(bodies, 1)
-    ]
+    messages = [stored(channel.w, seq, body) for seq, body in enumerate(bodies, 1)]
     runtime.client = SimpleNamespace(read=lambda *args: (200, {"messages": messages}))
 
     return runtime.poll(channel)
