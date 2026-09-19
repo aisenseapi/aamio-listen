@@ -56,6 +56,7 @@ def build(messages, held, root=None):
         {"seq": m["seq"], "at": m["at"], "sha256": m["sha256"], "from_key": m.get("from")}
         for m in messages[:held]
     ]
+    channel.observed = {m["seq"]: dict(m, verified=False, from_key=None) for m in messages[:held]}
     receipt = {
         "schema": "aamio-receipt-v1",
         "w": channel.w,
@@ -105,7 +106,7 @@ def test_a_receipt_that_does_not_add_up_is_caught_without_local_knowledge():
 
 def test_local_disagreement_is_still_reported():
     runtime = build(MESSAGES, held=2)
-    runtime.channels["inbox"].received[1]["sha256"] = "d" * 64
+    runtime.channels["inbox"].observed[2]["sha256"] = "d" * 64
     out = runtime.receipt()
 
     assert out["root_adds_up"] is True

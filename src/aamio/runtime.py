@@ -19,7 +19,7 @@ import re
 import threading
 import time
 
-from .client import AamioClient, DEFAULT_HOST, is_scope_address, is_scope_key, make_scope_key, scope_address
+from .client import AamioClient, DEFAULT_HOST, is_scope_address, is_scope_key, make_scope_key, normalize_allow, scope_address
 from .gate import GateStop, board_advised_bits, describe as describe_seconds, plan as gate_plan, solve as gate_solve, solve_board
 from .crypto import Keys, board_delete_signing_input, board_signing_input, check_message, is_envelope, is_key, key_hash, presence_signing_input, sha256hex, thread_signing_input, unb64url
 
@@ -190,7 +190,7 @@ class Channel:
         self.read_key = read_key
         self.w = w
         self.expire_at = int(expire_at)
-        self.allow = list(allow or [])
+        self.allow = normalize_allow(allow)
         self.after = int(after)
         # Which thread at this address the cursor and the hashes belong to. A
         # restart can take the thread and a write can open a new one at the
@@ -198,8 +198,13 @@ class Channel:
         # thing that tells the two apart.
         self.created_at = created_at
         self.gone = False
+        # How many messages the last poll had fetched and left for the next
+        # one, because the caller's limit was reached. They are still at the
+        # service and the cursor stands before them.
+        self.left_waiting = 0
         self.seen = set()
         self.received = []
+        self.observed = {}
         self.lock = threading.Lock()
         self.poller = None
         self.closed = False
@@ -215,16 +220,18 @@ class Channel:
         """
         self.after = 0
         self.created_at = None
+        self.observed.clear()
 
     def to_state(self):
         # seen travels with the channel: without it a restart cannot tell a
         # redelivered message from a new one, and the model may act twice.
-        return {"label": self.label, "read_key": self.read_key, "w": self.w, "expire_at": self.expire_at, "allow": self.allow, "after": self.after, "created_at": self.created_at, "seen": sorted(self.seen)}
+        return {"label": self.label, "read_key": self.read_key, "w": self.w, "expire_at": self.expire_at, "allow": self.allow, "after": self.after, "created_at": self.created_at, "gone": self.gone, "seen": sorted(value for value in self.seen if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value))}
 
     @classmethod
     def from_state(cls, item):
         channel = cls(item["label"], item["read_key"], item["w"], item["expire_at"], item.get("allow"), item.get("after", 0), item.get("created_at"))
-        channel.seen = set(item.get("seen") or [])
+        channel.seen = {value for value in item.get("seen") or [] if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)}
+        channel.gone = item.get("gone") is True
 
         return channel
 
@@ -262,6 +269,12 @@ class Runtime:
         for item in state.get("channels") or []:
             channel = Channel.from_state(item)
             if channel.expire_at > time.time():
+                held = self.channels.get(channel.label)
+                if held is not None:
+                    if held.expire_at > channel.expire_at:
+                        self._retire_channel(channel)
+                        continue
+                    self._retire_channel(held)
                 self.channels[channel.label] = channel
         self.outbox = self._load_json("outbox.json", {})
         self.effects = self._load_json("effects.json", {})
@@ -673,6 +686,17 @@ class Runtime:
 
     # ------------------------------------------------------------ inbox --
 
+    def _retire_channel(self, channel):
+        """Keep both channels, also when old state used one label twice."""
+        base = "%s-%d" % (channel.label, channel.expire_at)
+        label = base
+        suffix = 1
+        while label in self.channels and self.channels[label] is not channel:
+            label = "%s-%d" % (base, suffix)
+            suffix += 1
+        channel.label = label
+        self.channels[label] = channel
+
     def ensure_inbox(self):
         inbox = self.channels.get("inbox")
         # A gone inbox is opened again at once. A write to the old address
@@ -690,7 +714,7 @@ class Runtime:
         with self.lock:
             if old is not None:
                 # Keep reading the old one until it dies; partners may still write there.
-                self.channels["inbox-%d" % old.expire_at] = old
+                self._retire_channel(old)
             self.channels["inbox"] = inbox
         self.save_state()
         self.log("inbox %s until %d%s" % (w, inbox.expire_at, " (allowlist %d keys)" % len(allow) if allow else ""))
@@ -756,7 +780,7 @@ class Runtime:
         does not mean an open conversation.
         """
         held = self.channels.get("board")
-        if held and held.expire_at - time.time() > seconds:
+        if held and held.expire_at - time.time() > seconds and not held.gone:
             return held
         ttl = min(INBOX_TTL, max(int(seconds) + 60, 900))
         status, data, read_key, w = self.client.open_thread(ttl, ["*"])
@@ -765,7 +789,7 @@ class Runtime:
         channel = Channel("board", read_key, w, data["expire_at"], ["*"])
         with self.lock:
             if held is not None:
-                self.channels["board-%d" % held.expire_at] = held
+                self._retire_channel(held)
             self.channels["board"] = channel
         self.save_state()
         self.log("board inbox %s until %d (any key, signed only)" % (w, channel.expire_at))
@@ -957,17 +981,25 @@ class Runtime:
             body["data"] = data
         plaintext = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         envelope = self.keys.seal(post["key"], plaintext)
-        notes = []
-        status, result = self._post(post["w"], envelope, notes)
-        self.archive("board", {"kind": "answered", "at": time.time(), "post": post["id"], "w": post["w"], "status": status, "body": body})
+        # An answer is a send, and goes the way a send goes: one outbox entry
+        # written before the first attempt, and an outcome that tells refused
+        # from unknown. It used to post the envelope directly. When no answer
+        # came back it raised "answer failed", with no message id and nothing
+        # in the outbox, although the message may have landed; the only move
+        # left was to answer again, which seals a new envelope with a new
+        # nonce, and the poster cannot tell that from a second answer. From
+        # the outbox the same bytes go again, and a copy is a replay there.
+        entry = self._outbox_add(post["w"], post["key"], envelope, body)
+        status, result = self._deliver(entry)
+        self.archive("board", {"kind": "answered", "at": time.time(), "post": post["id"], "w": post["w"], "status": status, "message_id": entry["id"], "outcome": entry["status"], "body": body})
         if status != 201:
-            raise RuntimeError("answer failed: %s %s" % (status, result))
-        answer = {"post": post["id"], "w": post["w"], "seq": result["seq"], "at": result["at"], "replies_arrive_on": "board", "reply_to": channel.w}
+            raise SendFailed(entry["status"], entry["id"], status, result)
+        answer = {"post": post["id"], "w": post["w"], "message_id": entry["id"], "seq": result["seq"], "at": result["at"], "replies_arrive_on": "board", "reply_to": channel.w}
         if "met" in result:
             answer["met"] = result["met"]
             answer["proof_id"] = result.get("proof_id")
-        if notes:
-            answer["notes"] = notes
+        if entry.get("gate_notes"):
+            answer["notes"] = entry["gate_notes"]
         if own_post:
             answer["warning"] = "You answered your own post. The answer is sealed to your own key, so it reaches nobody but you."
         return answer
@@ -1671,15 +1703,21 @@ class Runtime:
 
         return {"text": parsed}, {"signed": True, "encrypted": True, "format": "json"}
 
-    def _note(self, channel, state, what):
+    def _note(self, channel, state, what, seqs=None):
         """Something a caller has to hear about, even though the read returned no messages."""
-        self._note_trouble(channel.label, state, what, w=channel.w)
+        self._note_trouble(channel.label, state, what, w=channel.w, seqs=seqs)
 
-    def _note_trouble(self, where, state, what, w=None):
+    def _note_trouble(self, where, state, what, w=None, seqs=None):
         note = {"channel": where, "w": w, "state": state, "what": what, "at": int(time.time())}
         with self.lock:
             if not hasattr(self, "attention"):
                 self.attention = {}
+            if state in ("kept_out", "unverified") and seqs is not None:
+                previous = self.attention.get((where, state), {})
+                note["seqs"] = previous.get("seqs", []) + list(seqs)
+                note["count"] = len(note["seqs"])
+                note["details"] = previous.get("details", []) + [what]
+                note["what"] = "%d message(s) (seq %s): %s" % (note["count"], ", ".join(str(seq) for seq in note["seqs"]), " ".join(note["details"]))
             self.attention[(where, state)] = note
         self.log("%s: %s" % (where, what))
 
@@ -1690,13 +1728,50 @@ class Runtime:
             self.attention = {}
         return taken
 
-    def poll(self, channel, wait=0):
+    def _read_entry(self, channel, raw):
+        """Check and decode one message without lending it the service's authority."""
+        message = raw if isinstance(raw, dict) else {}
+        seq = message.get("seq") if type(message.get("seq")) is int else 0
+        at = message.get("at") if type(message.get("at")) is int else 0
+        try:
+            if not isinstance(raw, dict) or type(message.get("seq")) is not int or type(message.get("at")) is not int:
+                raise ValueError("invalid message metadata")
+            verified, why_not, digest = check_message(channel.w, message)
+            # The HTTP reader already cleared failed claims. Keep its reason
+            # instead of replacing it with 'no sender' on this second check.
+            if not verified:
+                why_not = message.get("unverified_because") or why_not
+            sender = message.get("from") if verified else None
+            checked = dict(message, verified=verified, sha256=digest, **{"from": sender})
+            body, meta = self._open(checked)
+            known = self.name_for_key(sender)
+            entry = {"channel": channel.label, "seq": seq, "at": at, "verified": verified, "from_key": sender, "known_contact": known is not None, "sender": known or ("unknown key" if sender else "unsigned"), "sha256": digest, "replay": digest is not None and digest in channel.seen, "body": body}
+            entry.update(meta)
+            if why_not:
+                entry["unverified_because"] = why_not
+            return entry
+        except Exception as error:
+            why = "the message could not be checked here: " + error.__class__.__name__
+            return {"channel": channel.label, "seq": seq, "at": at, "verified": False, "from_key": None, "known_contact": False, "sender": "unsigned", "sha256": None, "replay": False, "body": {"text": message.get("body")}, "signed": False, "encrypted": False, "format": "unreadable", "error": error.__class__.__name__, "unverified_because": why}
+
+    def poll(self, channel, wait=0, limit=None):
+        """Reads one channel. With a limit, at most that many messages are handed over.
+
+        The cursor then stops at the last message this call dealt with, and
+        what the service returned beyond it is fetched again by the next poll.
+        It used to be the caller that cut the list, after the cursor had moved
+        past everything: the messages over the limit were gone for good.
+        """
+        channel.left_waiting = 0
         status, data = self.client.read(channel.w, channel.read_key, channel.after, wait)
         if status == 410:
             self._note(channel, "expired", "the thread at this address has expired, so anything written to it before now is gone and nothing more will arrive here")
             return "expired", []
         if status != 200:
             self._note(channel, "unread", "the service answered %s, so this channel was not read and there may be messages waiting" % status)
+            return "error", []
+        if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+            self._note(channel, "unread", "the service returned a malformed read answer; this channel was not read")
             return "error", []
         # Three answers that used to read as a quiet inbox. No thread at the
         # address: never written to, swept after expiry, or taken by a
@@ -1719,57 +1794,41 @@ class Runtime:
         if channel.created_at is not None and created is not None and created != channel.created_at and not reset:
             self._note(channel, "restarted", "the thread at this address is a new one, opened at %s where this channel knew one opened at %s, so it is read again from the start" % (created, channel.created_at))
             channel.forget_thread()
-            return self.poll(channel, 0)
+            return self.poll(channel, 0, limit)
         if reset:
             self._note(channel, "restarted", (reset.get("what") if isinstance(reset, dict) else None) or "the service read this thread from the start")
+            channel.observed.clear()
         channel.created_at = created
         entries = []
         kept_out = []
         last_seq = None
-        for message in data.get("messages", []):
-            last_seq = message["seq"] if last_seq is None else max(last_seq, message["seq"])
-            # What the service says about a message is the service's word. The
-            # hash and the signature are checked here, and everything below
-            # goes by that: whose message it is, whether it is opened, and
-            # whether this channel takes it at all.
-            verified, why_not, digest = check_message(channel.w, message)
-            sender_key = message.get("from") if verified else None
-            if why_not is not None and message.get("verified"):
-                self._note(channel, "unverified", "message %s on this channel was called verified by the service and does not check out here: %s. It is handed over as unverified. That is a fault in the service or an operator that lies, and whoever runs it should hear of it." % (message["seq"], why_not))
-            # The allowlist is this channel's too. The service enforces it for
-            # as long as it holds the thread, and it holds it in memory: when
-            # the store is emptied, a write to the address opens a thread with
-            # no list at all. What the channel was opened for is kept with its
-            # read key, and applied to what it reads.
-            if channel.allow and not (verified and (channel.allow == ["*"] or sender_key in channel.allow)):
-                kept_out.append(message["seq"])
+        fetched = data.get("messages", [])
+        for index, raw in enumerate(fetched):
+            if limit is not None and len(entries) >= limit:
+                channel.left_waiting = len(fetched) - index
+                break
+            entry = self._read_entry(channel, raw)
+            message = raw if isinstance(raw, dict) else {}
+            last_seq = entry["seq"] if last_seq is None else max(last_seq, entry["seq"])
+            sender_key = entry["from_key"]
+            excluded = bool(channel.allow and not (entry["verified"] and ("*" in channel.allow or sender_key in channel.allow)))
+            with channel.lock:
+                channel.observed[entry["seq"]] = {"seq": entry["seq"], "at": entry["at"], "sha256": entry["sha256"], "from": message.get("service_from", message.get("from")), "verified": entry["verified"], "from_key": sender_key}
+            why_not = entry.get("unverified_because")
+            if why_not and message.get("service_verified", message.get("verified")):
+                disposition = "kept out by this channel's list" if excluded else "handed over as unverified"
+                self._note(channel, "unverified", "message %s on this channel was called verified by the service and does not check out here: %s. It is %s. That is a fault in the service or an operator that lies, and whoever runs it should hear of it." % (entry["seq"], why_not, disposition), seqs=[entry["seq"]])
+            if excluded:
+                kept_out.append(entry["seq"])
                 continue
-            message = dict(message, verified=verified, sha256=digest or message.get("sha256"), **{"from": sender_key})
-            # sender is a name when we know the key and a label when we do
-            # not, which reads well and answers the wrong question. Whether a
-            # signature checked out, which key made it, and whether that key is
-            # someone we have met are three separate facts, and a reader has to
-            # be able to act on each: a verified stranger is not a contact, and
-            # a contact can still send something not to be trusted.
-            known = self.name_for_key(message["from"])
-            entry = {"channel": channel.label, "seq": message["seq"], "at": message["at"], "verified": message["verified"], "from_key": message["from"], "known_contact": known is not None, "sender": known or ("unknown key" if message["from"] else "unsigned"), "sha256": message["sha256"], "replay": message["sha256"] in channel.seen}
-            if why_not is not None:
-                entry["unverified_because"] = why_not
-            channel.seen.add(message["sha256"])
-            try:
-                body, meta = self._open(message)
-            except Exception as error:
-                # Whatever went wrong belongs to this message alone. Losing the
-                # rest of the batch to it would be the expensive mistake.
-                body, meta = {"text": message.get("body")}, {"signed": bool(message.get("from")), "encrypted": False, "format": "undecodable", "error": error.__class__.__name__}
-            entry["body"] = body
-            entry.update(meta)
+            if entry["sha256"] is not None:
+                channel.seen.add(entry["sha256"])
             # Before the message is kept, archived or shown: a scope key in it
             # goes to scopes.json or nowhere, never to the reader.
             self._take_scope_share(entry)
-            if isinstance(entry["body"], dict) and isinstance(entry["body"].get("reply_to"), str) and message["from"]:
+            if isinstance(entry["body"], dict) and isinstance(entry["body"].get("reply_to"), str) and sender_key:
                 with self.lock:
-                    self.peers[entry["body"]["reply_to"]] = message["from"]
+                    self.peers[entry["body"]["reply_to"]] = sender_key
             entries.append(entry)
             with channel.lock:
                 channel.received.append(entry)
@@ -1805,13 +1864,21 @@ class Runtime:
             # be told from one that was never sent.
             channel.after = max(channel.after, last_seq)
             self.save_state()
-            opened_for = "any key, signed only" if channel.allow == ["*"] else "%d named key(s)" % len(channel.allow)
-            self._note(channel, "kept_out", "%d message(s) were kept out of this channel (seq %s%s): it was opened for %s, and these were not signed by a key it allows, as checked here. The service enforces the list while it holds the thread; a thread written to after the service lost its store has none, which is how they got this far. They are not handed over and not archived." % (len(kept_out), ", ".join(str(seq) for seq in kept_out[:10]), " and more" if len(kept_out) > 10 else "", opened_for))
+            opened_for = "any key, signed only" if "*" in channel.allow else "%d named key(s)" % len(channel.allow)
+            self._note(channel, "kept_out", "This channel was opened for %s, and these messages did not satisfy that list as checked here. They are not handed over and not archived." % opened_for, seqs=kept_out)
         # After a reset the service's next is the cursor, and it is lower than
         # the one this channel held. Keeping the higher of the two would ask
         # past the new thread on every call and hand the same messages over
         # each time.
-        if reset and isinstance(data.get("next"), int):
+        #
+        # A poll that stopped at its limit is the exception: the service's next
+        # covers messages this call never looked at, so the cursor is the last
+        # one it did look at, handed over or kept out.
+        if channel.left_waiting:
+            if last_seq is not None:
+                channel.after = last_seq
+                self.save_state()
+        elif type(data.get("next")) is int:
             channel.after = data["next"]
             self.save_state()
         return "ok", entries
@@ -1875,20 +1942,41 @@ class Runtime:
             self.publish_presence()
             collected = []
             waited = False
+            left_waiting = 0
+            not_asked = []
             for channel in list(self.channels.values()):
-                state, entries = self.poll(channel, 0 if waited else wait)
+                # A channel is only asked for what this call still has room
+                # for. poll moves the cursor and saves it before the caller
+                # sees a message, so whatever was fetched beyond the limit and
+                # cut off here afterwards was past the cursor and never came
+                # back: 60 waiting, 50 handed over, the last ten gone.
+                room = limit - len(collected)
+                if room <= 0:
+                    not_asked.append(channel.label)
+                    continue
+                try:
+                    state, entries = self.poll(channel, 0 if waited else wait, room)
+                except Exception as error:
+                    self._note(channel, "unread", "this channel could not be read: %s. Messages from the other channels are still returned." % error.__class__.__name__)
+                    continue
                 # A channel that answered 410 or nothing at all used to eat the
                 # whole wait, so a read with wait 25 came back at once and the
                 # inbox was only ever asked with wait 0. A gone one did wait:
                 # the service holds a read of a missing thread for a write.
                 waited = waited or state in ("ok", "gone")
                 collected.extend(entries)
-            if len(collected) > limit:
-                # The cursor has already moved past all of them. The surplus is
-                # in the archive, and a read will not hand it over again, so
-                # saying nothing here loses messages the runtime did receive.
-                self._note_trouble("read", "truncated", "%d more messages were read than this call hands over, and the cursor has moved past them. They are in the archive, and another read will not bring them back. Ask for a higher limit to see them here." % (len(collected) - limit))
-            return collected[:limit]
+                left_waiting += channel.left_waiting
+            if left_waiting or not_asked:
+                # Nothing is lost, and the caller still has to hear it: a read
+                # that stopped at its limit is not a read of everything.
+                self._note_trouble("read", "more", "this read stopped at its limit of %d message(s). %s Nothing was passed over: every cursor stands at the last message this read dealt with, so read again for the rest." % (
+                    limit,
+                    " ".join(part for part in (
+                        "%d more that the service had already returned were left where they are." % left_waiting if left_waiting else "",
+                        "%d channel(s) were not asked this time: %s." % (len(not_asked), ", ".join(not_asked)) if not_asked else "",
+                    ) if part),
+                ))
+            return collected
         collected = []
         deadline = time.time() + max(0, int(wait))
         while len(collected) < limit:
@@ -1916,27 +2004,44 @@ class Runtime:
         # a receipt that does not add up, and it needs nothing from us.
         #
         # Whether it agrees with what we saw is a stronger claim, and one we
-        # can only make when we hold every message it counts. `received` lives
-        # in this process and nowhere else, so a one-shot `aamio-listen
+        # can make when we hold every message it counts; fewer receipt lines
+        # than observed messages is a mismatch too. Observations include
+        # kept-out messages but live only in this process, so `aamio-listen
         # receipt` holds none of them and the old field said False: a good
         # receipt reported as a mismatch, which is the one thing a proof must
         # never do. It says None now, with the count, so "not compared" cannot
         # be read as "did not match".
         with channel.lock:
-            entries = sorted(channel.received, key=lambda e: e["seq"])
+            entries = sorted(channel.observed.values(), key=lambda e: e["seq"])
         held = len(entries)
         line = "%d\t%d\t%s\t%s\n"
         listed = "".join(line % (m["seq"], m["at"], m["sha256"], m.get("from") or "-") for m in (data.get("messages") or []))
-        ours = "".join(line % (e["seq"], e["at"], e["sha256"], e["from_key"] or "-") for e in entries)
+        ours = "".join(line % (e["seq"], e["at"], e["sha256"], e.get("from") or "-") for e in entries)
         comparable = held == data["count"]
+        verified_keys = {e.get("from_key") for e in entries if e.get("verified") and isinstance(e.get("from_key"), str)}
+        claimed_keys = data.get("keys", [])
+        unverified_keys = [key for key in claimed_keys if not isinstance(key, str) or key not in verified_keys]
         # Sign what we took, so partners can exchange receipts and compare
         # without trusting the network's word alone.
         attestation = "aamio-receipt-v1\n%s\n%s\n%d\n%d" % (channel.w, data["root"], data["count"], data.get("issued_at", 0))
-        result = {"label": label, "w": channel.w, "root": data["root"], "commitment": data.get("commitment"), "count": data["count"], "keys": [self.name_for_key(k) or k for k in data.get("keys", [])], "root_adds_up": sha256hex(listed) == data["root"], "held_locally": held, "local_root_matches": (sha256hex(ours) == data["root"]) if comparable else None, "signed_by": self.keys.public, "signature": self.keys.sign(attestation), "signed_text": attestation, "receipt": data}
+        result = {"label": label, "w": channel.w, "root": data["root"], "commitment": data.get("commitment"), "count": data["count"], "keys": [(self.name_for_key(k) or k) if isinstance(k, str) and k in verified_keys else k for k in claimed_keys], "keys_unverified_count": len(unverified_keys), "keys_service_claim_only": unverified_keys, "root_adds_up": sha256hex(listed) == data["root"], "held_locally": held, "local_root_matches": (sha256hex(ours) == data["root"]) if comparable else (False if held > data["count"] else None), "signed_by": self.keys.public, "signature": self.keys.sign(attestation), "signed_text": attestation, "receipt": data}
 
-        if not comparable:
+        if comparable:
+            local = {entry["seq"]: entry for entry in entries}
+            differences = []
+            for message in data.get("messages") or []:
+                observed = local.get(message["seq"])
+                fields = [field for field in ("at", "sha256", "from") if observed is None or observed.get(field) != message.get(field)]
+                if fields:
+                    differences.append({"seq": message["seq"], "fields": fields})
+            result["local_differences"] = differences
+            result["signers_not_verified_locally"] = [entry["seq"] for entry in entries if entry.get("from") and not entry.get("verified")]
+
+        if held > data["count"]:
+            result["local_check"] = "Mismatch: the receipt counts fewer messages than this process read. The thread was replaced or the service lost messages."
+        elif not comparable:
             result["local_check"] = ("Not compared: this process holds %d of the %d messages the receipt counts, so a local root would differ for a reason that is not the receipt's. "
-                "The receipt stands on root_adds_up and the signature. For the independent check, take the receipt in the process that read the messages." % (held, data["count"]))
+                "root_adds_up checks only the receipt's arithmetic; our signature records what was fetched, not that its claims are true. For the independent check, take the receipt in the process that read the messages." % (held, data["count"]))
         if anchor:
             idem = sha256hex("aamio-listen:%s:%s" % (self.keys.hash, data["root"]))[:32]
             status, proof = self.client.anchor(data["root"], idem)

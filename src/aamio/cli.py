@@ -28,11 +28,37 @@ import sys
 
 from . import __version__
 from .gate import GateStop
-from .runtime import Runtime, BOARD_TTL
+from .runtime import Runtime, SendFailed, send_advice, BOARD_TTL
 
 
 def out(value):
     print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def send_failed(error, operation):
+    """A send that stored nothing, as JSON and not as a traceback.
+
+    One command is one process, so an exception that escaped was a traceback on
+    stderr, and the message id a retry needs was nowhere in it. Unknown is not
+    failure: the message may be on the other side, and sending it again as a
+    new message makes a second one. What goes again is the stored bytes, and
+    here there is a command for that.
+    """
+    retryable, _ = send_advice(error.outcome, error.status)
+
+    if error.outcome == "unknown":
+        fix = ("No answer came back, so this message may already have been delivered. Do not send it again as a new message: "
+               "`aamio outbox retry --id %s` sends the same stored bytes again, and a copy that did land is marked a replay where it arrives. "
+               "`aamio outbox pending` lists what has no settled outcome on this machine." % error.message_id)
+    elif retryable:
+        fix = ("aamio declined this for now, not because of the message: %s is a rate window or a busy service. Do not change the content. "
+               "Wait, then run `aamio outbox retry --id %s`, which sends the stored bytes again." % (error.status, error.message_id))
+    else:
+        fix = send_advice(error.outcome, error.status)[1]
+
+    out({"error": str(error), "error_code": "send_" + error.outcome, "operation": operation, "outcome": error.outcome, "message_id": error.message_id, "status": error.status, "retryable": retryable, "fix": fix})
+
+    return 1
 
 
 def main(argv=None):
@@ -178,6 +204,8 @@ def run(args, runtime):
         data = json.loads(args.data) if args.data else None
         try:
             out(runtime.send(args.to, args.text, data))
+        except SendFailed as failed:
+            return send_failed(failed, "send")
         except GateStop as stop:
             # Not a crash: the inbox asked for something this client does not
             # do, nothing was sent, and the reader needs the reason and the way on.
@@ -208,6 +236,8 @@ def run(args, runtime):
         elif args.board_command == "answer":
             try:
                 out(runtime.board_answer(args.post, args.text, scope=args.scope))
+            except SendFailed as failed:
+                return send_failed(failed, "board_answer")
             except GateStop as stop:
                 out({"error": stop.reason, "error_code": "gate", "fix": stop.fix})
                 return 1

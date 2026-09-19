@@ -95,18 +95,21 @@ def test_the_model_is_told_over_mcp_as_well():
     assert "attention" not in quiet["structuredContent"]
 
 
-def test_a_read_that_hands_over_less_than_it_took_says_so():
-    """poll moves the cursor and saves it before the caller sees a message, so
-    whatever read cuts off the end is past the cursor and will not come back."""
+def test_a_read_that_stops_at_its_limit_says_so():
+    """It used to say more than that: the cursor had moved past what was cut
+    off, so the note was the only trace of ten messages. Now the cursor stops
+    with the read, and the note says to read again. tests/test_read_limit.py
+    follows the messages themselves."""
     many = [stored("i" * 20, n, '{"n":%d}' % n) for n in range(1, 61)]
-    runtime = build([(200, {"messages": many})])
+    runtime = build([(200, {"messages": many, "next": 60})])
     runtime._open = lambda message: ({"text": "x"}, {"signed": True, "encrypted": False, "format": "json"})
     got = runtime.read(limit=50)
     attention = runtime.attention_taken()
 
     assert len(got) == 50
-    assert [(a["channel"], a["state"]) for a in attention] == [("read", "truncated")]
-    assert "10 more messages" in attention[0]["what"]
+    assert runtime.channels["inbox"].after == 50
+    assert [(a["channel"], a["state"]) for a in attention] == [("read", "more")]
+    assert "10 more" in attention[0]["what"] and "read again" in attention[0]["what"]
 
 
 def test_a_dead_channel_does_not_eat_the_whole_wait():

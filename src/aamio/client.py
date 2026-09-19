@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 
 from . import __version__
-from .crypto import b64url, sha256hex
+from .crypto import b64url, check_message, sha256hex
 
 # Where this client points unless told otherwise, all in one place. Read
 # DEFAULT_HOST + "/llms.txt" before changing them: moves, reserve hosts and
@@ -39,6 +39,8 @@ def write_address(read_key: str) -> str:
     import base64
     import hashlib
 
+    if not isinstance(read_key, str) or re.fullmatch(r"[a-z0-9]{20,64}", read_key) is None:
+        raise ValueError("invalid read key")
     return base64.b32encode(hashlib.sha256(read_key.encode("ascii")).digest()).decode("ascii").lower()[:20]
 
 
@@ -59,6 +61,8 @@ def scope_address(scope_key: str) -> str:
     import base64
     import hashlib
 
+    if not is_scope_key(scope_key):
+        raise ValueError("invalid scope key")
     return base64.b32encode(hashlib.sha256(("aamio-scope-v1\n" + scope_key).encode("ascii")).digest()).decode("ascii").lower()[:20]
 
 
@@ -68,6 +72,19 @@ def is_scope_key(text) -> bool:
 
 def is_scope_address(text) -> bool:
     return isinstance(text, str) and re.fullmatch(r"[a-z2-7]{20}", text) is not None
+
+
+def normalize_allow(allow):
+    """Keep the requested policy, in the same form sent to the service."""
+    keys = []
+    for entry in allow or []:
+        if not isinstance(entry, str):
+            raise ValueError("an allowlist entry must be a string")
+        for key in entry.split(","):
+            key = key.strip()
+            if key and key not in keys:
+                keys.append(key)
+    return ["*"] if "*" in keys else keys
 
 
 class AamioClient:
@@ -120,6 +137,7 @@ class AamioClient:
     # threads
 
     def open_thread(self, ttl: int, allow_keys=None):
+        allow_keys = normalize_allow(allow_keys)
         read_key = make_read_key()
         w = write_address(read_key)
         headers = {"X-Read": read_key, "X-TTL": str(int(ttl))}
@@ -157,7 +175,25 @@ class AamioClient:
         path = "/%s/after/%d" % (w, int(after))
         if wait > 0:
             path += "/wait/%d" % min(int(wait), 25)
-        return self.call("GET", path, None, {"X-Read": read_key}, timeout=max(self.timeout, wait + 15))
+        status, data = self.call("GET", path, None, {"X-Read": read_key}, timeout=max(self.timeout, wait + 15))
+        if status == 200 and isinstance(data, dict) and isinstance(data.get("messages"), list):
+            messages = []
+            for raw in data.get("messages") or []:
+                message = dict(raw) if isinstance(raw, dict) else {}
+                message["service_verified"] = message.get("verified") is True
+                message["service_from"] = message.get("from")
+                try:
+                    verified, why, digest = check_message(w, raw)
+                except Exception as error:
+                    verified, why, digest = False, "the message could not be checked here: " + error.__class__.__name__, None
+                message.update(verified=verified, sha256=digest)
+                message["from"] = message.get("from") if verified else None
+                message.pop("unverified_because", None)
+                if why:
+                    message["unverified_because"] = why
+                messages.append(message)
+            data = dict(data, messages=messages)
+        return status, data
 
     def receipt(self, w: str, read_key: str):
         return self.call("GET", "/%s/receipt" % w, None, {"X-Read": read_key})

@@ -128,12 +128,15 @@ def check_message(w: str, message: dict):
     for a message that verified and for an ordinary unsigned one, and a sentence
     when something that should have held did not.
     """
-    body = message.get("body")
+    body = message.get("body") if isinstance(message, dict) else None
 
     if not isinstance(body, str):
         return False, "the message has no body to check", None
 
-    digest = sha256hex(body)
+    try:
+        digest = sha256hex(body)
+    except UnicodeEncodeError:
+        return False, "the message could not be checked here: UnicodeEncodeError", None
 
     if message.get("sha256") != digest:
         return False, "the body does not hash to the sha256 the service gave with it, so these are not the bytes that were stored", digest

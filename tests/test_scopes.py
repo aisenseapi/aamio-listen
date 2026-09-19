@@ -76,6 +76,9 @@ def build(home):
     runtime.keys = SimpleNamespace(public="our-key", hash="0" * 64, seal=lambda key, plaintext: runtime.sealed.append((key, plaintext.decode("utf-8"))) or "sealed", sign=lambda text: runtime.signed.append(text) or "sig")
     runtime.listener = None
     runtime.board_advised_bits = 0
+    # An answer to a post goes through the outbox, as a send does, and the
+    # outbox is saved for real: one test reads the file.
+    runtime.outbox = {}
     os.makedirs(os.path.join(home, "archive"), exist_ok=True)
 
     return runtime
