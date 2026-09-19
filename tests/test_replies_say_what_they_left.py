@@ -27,6 +27,7 @@ def replies_answer(left_out):
         board_reply_address=lambda: {"open": True, "w": "b" * 20},
         attention_taken=lambda: [],
         read=lambda wait=0: [],
+        board_poll=lambda wait=0: [],
         board_replies_left_out=left_out,
     )
     original = cli.out

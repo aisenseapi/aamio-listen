@@ -26,13 +26,61 @@ import argparse
 import json
 import sys
 
-from . import __version__
+from . import __version__, compat, storage
 from .gate import GateStop
 from .runtime import Runtime, SendFailed, send_advice, BOARD_TTL
 
 
 def out(value):
     print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def runtime_tags(args):
+    """The presence tags of this runtime, when the command is one that sets them.
+
+    --tags on `board post` are the tags of that post, and on `board find` a
+    filter. Every --tags used to become the runtime's own: whoami showed the
+    last post's tags, and presence published them as where this key can be
+    reached.
+    """
+    if getattr(args, "command", None) == "board" or not getattr(args, "tags", None):
+        return None
+
+    return [t for t in args.tags.split(",") if t]
+
+
+def set_archive(runtime, policy):
+    """The home's own choice, written where the next process finds it."""
+    runtime._save_json("config.json", {"archive": policy})
+    runtime.archive_policy = policy
+    runtime.archive_enabled = policy["mode"] != "off"
+    runtime._prune()
+
+
+def doctor(runtime):
+    """One answer to three questions: does this client fit the service, who can read the home, what is kept.
+
+    Nothing here is a guess reported as a finding. What could not be checked
+    says so, and is never called fine.
+    """
+    status, health = runtime.client.health()
+    service = {"host": runtime.host, "reachable": status == 200}
+    if status == 200 and isinstance(health, dict):
+        service.update(version=health.get("version"), revision=health.get("revision"))
+    else:
+        service["problem"] = "no answer from /health (%s), so nothing below about the service was checked" % status
+    status, descriptor = runtime.client.descriptor()
+    fits = compat.check(descriptor if status == 200 else None)
+    if status != 200:
+        fits.update(verdict="unknown", why="the descriptor could not be read (%s), so compatibility was not checked" % status)
+    return {
+        "client": {"name": "aamio-python", "version": __version__, "protocol": compat.PROTOCOL},
+        "service": service,
+        "compatibility": fits,
+        "storage": storage.check(runtime.home),
+        "archive": storage.status(runtime.home, runtime.archive_policy),
+        "outbox_pending": len(runtime.outbox_pending()),
+    }
 
 
 def send_failed(error, operation):
@@ -56,7 +104,13 @@ def send_failed(error, operation):
     else:
         fix = send_advice(error.outcome, error.status)[1]
 
-    out({"error": str(error), "error_code": "send_" + error.outcome, "operation": operation, "outcome": error.outcome, "message_id": error.message_id, "status": error.status, "retryable": retryable, "fix": fix})
+    told = {"error": str(error), "error_code": "send_" + error.outcome, "operation": operation, "outcome": error.outcome, "message_id": error.message_id, "status": error.status, "retryable": retryable, "fix": fix}
+
+    if getattr(error, "opened", None):
+        told["opened"] = error.opened
+        told["fix"] = "The channel %s is open and listed by `aamio channel list`: only the message carrying its address did not land. %s" % (error.opened["label"], fix)
+
+    out(told)
 
     return 1
 
@@ -71,6 +125,12 @@ def main(argv=None):
 
     p = sub.add_parser("init")
     p.add_argument("--tags", default=None, help="comma separated presence tags")
+    p.add_argument("--archive", default=None, help="keep, off or days:N: what happens to decrypted messages on this machine")
+    p = sub.add_parser("archive", help="what is kept on this machine, and for how long")
+    p.add_argument("policy", nargs="?", default="status", help="status (default), keep, off, days:N, or prune")
+    p.add_argument("--max-mb", type=float, default=None, help="a ceiling on the archive's size, oldest first out")
+    p.add_argument("--all", action="store_true", help="with prune: remove the whole archive")
+    sub.add_parser("doctor", help="does this client fit the service, who can read the home, what is kept")
     sub.add_parser("whoami")
     p = sub.add_parser("partner")
     ps = p.add_subparsers(dest="action", required=True)
@@ -165,9 +225,9 @@ def main(argv=None):
     sub.add_parser("serve")
 
     args = parser.parse_args(argv)
-    tags = [t for t in args.tags.split(",") if t] if getattr(args, "tags", None) else None
+    tags = runtime_tags(args)
     try:
-        runtime = Runtime(home=args.home, host=args.host, tags=tags, archive=not args.no_archive, log=lambda line: print(line, file=sys.stderr))
+        runtime = Runtime(home=args.home, host=args.host, tags=tags, archive=False if args.no_archive else None, log=lambda line: print(line, file=sys.stderr))
     except RuntimeError as error:
         # Another runtime holds the home, or a file in it cannot be read. The
         # reason is the whole message, and it is not a crash.
@@ -175,6 +235,13 @@ def main(argv=None):
         return 1
     try:
         return run(args, runtime)
+    except SendFailed as failed:
+        return send_failed(failed, args.command)
+    except (RuntimeError, LookupError, ValueError) as error:
+        # One command is one process, and what it could not do is the answer,
+        # as JSON like every other answer here. It used to be a traceback.
+        out({"error": str(error), "error_code": error.__class__.__name__})
+        return 1
     finally:
         # One command, one process: the lock goes with it, as in aamio-php.
         # Left behind, the next command had to guess from a pid whether an
@@ -186,9 +253,26 @@ def main(argv=None):
 
 def run(args, runtime):
     if args.command == "init":
+        if getattr(args, "archive", None):
+            set_archive(runtime, storage.parse_policy(args.archive))
         runtime.ensure_inbox()
         runtime.save_state()
-        out(runtime.whoami())
+        # Said once, where a person sets the runtime up: the service forgets,
+        # and this folder does not unless it is told to.
+        out(dict(runtime.whoami(), local_storage=dict(storage.status(runtime.home, runtime.archive_policy), home=runtime.home, who_can_read=storage.check(runtime.home))))
+    elif args.command == "archive":
+        policy = getattr(args, "policy", "status") or "status"
+        if policy == "prune":
+            with runtime.archive_lock:
+                gone = storage.prune(runtime.home, runtime.archive_policy, everything=bool(getattr(args, "all", False)))
+            out(dict(storage.status(runtime.home, runtime.archive_policy), removed=gone["removed"]))
+        elif policy == "status":
+            out(storage.status(runtime.home, runtime.archive_policy))
+        else:
+            set_archive(runtime, storage.parse_policy(policy, getattr(args, "max_mb", None)))
+            out(storage.status(runtime.home, runtime.archive_policy))
+    elif args.command == "doctor":
+        out(doctor(runtime))
     elif args.command == "whoami":
         out(runtime.whoami())
     elif args.command == "partner":
@@ -242,8 +326,9 @@ def run(args, runtime):
                 out({"error": stop.reason, "error_code": "gate", "fix": stop.fix})
                 return 1
         elif args.board_command == "replies":
-            if args.wait:
-                runtime.read(args.wait)
+            # Always, and the board inboxes only. With no wait given this read
+            # nothing at all, and said nobody had answered.
+            runtime.board_poll(args.wait or 0)
             # The address comes with the answers. An empty list means one of
             # two very different things, and only this tells them apart.
             replies = runtime.board_replies(args.post)
@@ -266,7 +351,10 @@ def run(args, runtime):
         elif args.board_command == "withdraw":
             out(runtime.board_withdraw(args.post))
         else:
-            out(runtime.open_channel_with(args.key, args.ttl, None, args.reply_to, args.note))
+            try:
+                out(runtime.open_channel_with(args.key, args.ttl, None, args.reply_to, args.note))
+            except SendFailed as failed:
+                return send_failed(failed, "board_channel")
     elif args.command == "scope":
         if args.scope_command == "new":
             out(runtime.scope_new(args.name))

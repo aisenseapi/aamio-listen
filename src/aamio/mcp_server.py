@@ -149,7 +149,8 @@ def dispatch(runtime: Runtime, name: str, arguments: dict):
         return result_of({
             "error": str(error),
             "error_code": "send_" + error.outcome,
-            "operation": "board_answer" if name == "aamio_board_answer" else "send",
+            "operation": {"aamio_board_answer": "board_answer", "aamio_open_channel": "open_channel"}.get(name, "send"),
+            **({"opened": error.opened} if getattr(error, "opened", None) else {}),
             "outcome": error.outcome,
             "message_id": error.message_id,
             "status": error.status,

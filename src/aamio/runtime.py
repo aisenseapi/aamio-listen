@@ -19,6 +19,7 @@ import re
 import threading
 import time
 
+from . import storage
 from .client import AamioClient, DEFAULT_HOST, is_scope_address, is_scope_key, make_scope_key, normalize_allow, scope_address
 from .gate import GateStop, board_advised_bits, describe as describe_seconds, plan as gate_plan, solve as gate_solve, solve_board
 from .crypto import Keys, board_delete_signing_input, board_signing_input, check_message, is_envelope, is_key, key_hash, presence_signing_input, sha256hex, thread_signing_input, unb64url
@@ -176,12 +177,16 @@ class SendFailed(RuntimeError):
     the other side. The entry stays in the outbox under message_id.
     """
 
-    def __init__(self, outcome, message_id, status, detail):
+    def __init__(self, outcome, message_id, status, detail, opened=None):
         super().__init__("send %s (http %s): %s" % (outcome, status, detail))
         self.outcome = outcome
         self.message_id = message_id
         self.status = status
         self.detail = detail
+        # When the message that did not land was the one carrying the address
+        # of a channel just opened: the channel is there, and the caller has
+        # to be told which, or it is a thread nobody knows about.
+        self.opened = opened
 
 
 class Channel:
@@ -242,21 +247,69 @@ class Runtime:
     # file becomes a lost one, with the channels, partners or scope keys in it.
     KEPT_FILES = ("partners.json", "scopes.json", "state.json", "outbox.json", "effects.json")
 
-    def __init__(self, home=None, host=None, tags=None, archive=True, log=None):
+    # How long close waits for its threads. A poller sits in a long poll of up
+    # to twenty seconds, and close does not wait that out: what comes back
+    # after it finds the home let go and writes nothing.
+    CLOSE_WAIT = 2.0
+
+    def __init__(self, home=None, host=None, tags=None, archive=None, log=None):
         self.home = home or home_dir()
         self.host = host or os.environ.get("AAMIO_HOST") or DEFAULT_HOST
         self.client = AamioClient(self.host)
-        self.archive_enabled = archive
         self.log = log or (lambda line: None)
         self.closed = False
-        os.makedirs(self.home, exist_ok=True)
-        os.makedirs(os.path.join(self.home, "archive"), exist_ok=True)
+        self.home_released = False
+        self.archive_lock = threading.Lock()
+        storage.make_private_dir(self.home)
+        storage.make_private_dir(os.path.join(self.home, "archive"))
+        # The archive is the home's own choice, kept in config.json: keep, off,
+        # or so many days. archive=False turns it off for this process, which
+        # is what --no-archive does, and archive=True turns it on whatever the
+        # home says. It used to be on unless every command said otherwise.
+        self.archive_policy = storage.read_policy(self.home)
+        self.archive_enabled = self.archive_policy["mode"] != "off" if archive is None else bool(archive)
+        self.pruned_at = 0.0
         self.owns_lock = self._take_lock()
         try:
             self._load(tags)
+            self._tidy()
         except BaseException:
             self._release_lock()
             raise
+
+    def _tidy(self):
+        """What the home needs before the first read: private files, no leftovers, no archive past its lifetime."""
+        for path in storage.leftovers(self.home):
+            # A write that was interrupted. The file it was to replace is whole,
+            # since the rename never happened.
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        for path in storage.tighten(self.home):
+            self.log("made private: %s (an older version wrote it with the default mode)" % path)
+        if not storage.is_windows():
+            # Mode bits cost nothing to read. On Windows it is the access list
+            # that decides and reading it starts a shell, so that is left to
+            # `aamio doctor` and `aamio init`.
+            found = storage.check(self.home)
+            for finding in found["findings"][:5]:
+                self.log("WARNING: %s: %s. %s" % (finding.get("path", self.home), finding["problem"], found.get("fix", "")))
+        self._prune()
+
+    def _prune(self):
+        policy = getattr(self, "archive_policy", None) or storage.DEFAULT_POLICY
+        if not self.archive_enabled or not (policy.get("days") or policy.get("max_mb")):
+            return
+        self.pruned_at = time.time()
+        try:
+            with self.archive_lock:
+                gone = storage.prune(self.home, policy)
+        except OSError as error:
+            self.log("archive not pruned: %s" % error)
+            return
+        if gone["removed"]:
+            self.log("archive: %d record(s) past their lifetime removed" % gone["removed"])
 
     def _load(self, tags):
         self.keys = self._load_or_create_keys()
@@ -398,22 +451,30 @@ class Runtime:
             "or move it away to start without what was in it." % (self._path(name), why)
         )
 
-    def _save_json(self, name, value, private=False):
+    def _save_json(self, name, value, private=True):
+        """Every file here is private, from its first byte.
+
+        effects.json and partners.json used to be written with the default
+        mode: what this agent has done, and whom it talks to, readable by
+        anyone on the machine. private stays as an argument and means nothing
+        now; there is no file in this folder that others should read.
+        """
+        if getattr(self, "home_released", False) is True:
+            # After close the home may be another process's. A poller that
+            # comes back from its long poll then must not write its cursor:
+            # what it read went into a queue nobody reads again, and the next
+            # process reads those messages only if the cursor stays behind them.
+            self.log("%s not written: this runtime is closed" % name)
+            return
         path = self._path(name)
-        # Private from the first byte. Made 600 after the rename, the file was
-        # readable by anyone for a moment, and the temporary one for longer.
-        handle = os.fdopen(os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o666), "w", encoding="utf-8")
-        with handle:
+        with storage.open_private(path + ".tmp") as handle:
             json.dump(value, handle, ensure_ascii=False, indent=2)
             handle.flush()
-            # The rename is atomic, but only over bytes that reached the disk.
+            # The rename is atomic, but only over bytes that reached the disk,
+            # and the new name is there only when the folder is.
             os.fsync(handle.fileno())
-        if private:
-            try:
-                os.chmod(path + ".tmp", 0o600)
-            except OSError:
-                pass
         os.replace(path + ".tmp", path)
+        storage.sync_dir(os.path.dirname(path))
 
     def _load_or_create_keys(self):
         path = self._path("key")
@@ -448,7 +509,7 @@ class Runtime:
             self._save_json("effects.json", self.effects)
 
     def archive(self, label, record):
-        if not self.archive_enabled:
+        if not self.archive_enabled or getattr(self, "home_released", False) is True:
             return
         # ensure_ascii=False so ordinary non-English text stays readable in the
         # file. Some text cannot be written that way at all: JSON can carry a
@@ -462,8 +523,27 @@ class Runtime:
             line.encode("utf-8")
         except UnicodeEncodeError:
             line = json.dumps(record, ensure_ascii=True)
-        with open(os.path.join(self.home, "archive", "%s.jsonl" % label), "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        path = os.path.join(self.home, "archive", "%s.jsonl" % label)
+        # One writer at a time: every channel has a poller, and they archive.
+        with getattr(self, "archive_lock", None) or threading.Lock():
+            # A crash in the middle of a write leaves a last line with no end.
+            # Appended to as it was, the next record became part of that line,
+            # and a reader passed over both.
+            torn = False
+            try:
+                with open(path, "rb") as existing:
+                    existing.seek(0, os.SEEK_END)
+                    if existing.tell() > 0:
+                        existing.seek(-1, os.SEEK_END)
+                        torn = existing.read(1) != b"\n"
+            except OSError:
+                pass
+            with storage.open_private(path, append=True) as handle:
+                handle.write(("\n" if torn else "") + line + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        if time.time() - getattr(self, "pruned_at", 0.0) > 3600:
+            self._prune()
 
     # ---------------------------------------------------------- partners --
 
@@ -766,7 +846,9 @@ class Runtime:
         return {"label": label, "status": status, "deleted": status == 200}
 
     def channel_list(self):
-        return [{"label": c.label, "w": c.w, "expire_at": c.expire_at, "seconds_left": max(0, int(c.expire_at - time.time())), "allow": [self.name_for_key(k) or k for k in c.allow], "received": len(c.received)} for c in self.channels.values()]
+        # expired, since a channel past its time was listed like any other
+        # until a read took it away.
+        return [{"label": c.label, "w": c.w, "expire_at": c.expire_at, "seconds_left": max(0, int(c.expire_at - time.time())), "expired": c.expire_at <= time.time(), "allow": [self.name_for_key(k) or k for k in c.allow], "received": len(c.received)} for c in self.channels.values()]
 
 
     # ------------------------------------------------------------ board --
@@ -1004,6 +1086,28 @@ class Runtime:
             answer["warning"] = "You answered your own post. The answer is sealed to your own key, so it reaches nobody but you."
         return answer
 
+    def board_poll(self, wait=0):
+        """Reads the board inboxes, and only those, when nothing listens in the background.
+
+        `board replies` used to read them only when it was given a wait, so a
+        one-shot command said `replies: []` while answers lay on the inbox: an
+        outside agent watched that for twenty minutes. What waits on the other
+        channels is left where it is, for `read`.
+        """
+        if self.listener is not None:
+            return []
+        collected = []
+        waited = False
+        for channel in [c for c in list(self.channels.values()) if c.label == "board" or c.label.startswith("board-")]:
+            try:
+                state, entries = self.poll(channel, 0 if waited else wait)
+            except Exception as error:
+                self._note(channel, "unread", "this channel could not be read: %s." % error.__class__.__name__)
+                continue
+            waited = waited or state in ("ok", "gone")
+            collected.extend(entries)
+        return collected
+
     def board_replies(self, post_id=None):
         """Answers received on the board inbox, decrypted and verified, newest last.
 
@@ -1178,9 +1282,14 @@ class Runtime:
             if note:
                 body["text"] = str(note)
             envelope = self.keys.seal(key, json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-            status, handed = self._post(reply_to, envelope, [])
+            # The message that carries the address is a send, and goes through
+            # the outbox like one. It was posted directly, and a refusal was a
+            # RuntimeError: a traceback on the command line, with the channel
+            # open and the address delivered to nobody.
+            entry = self._outbox_add(reply_to, key, envelope, body)
+            status, handed = self._deliver(entry)
             if status != 201:
-                raise RuntimeError("channel opened but the address could not be handed over: %s %s" % (status, handed))
+                raise SendFailed(entry["status"], entry["id"], status, handed, opened={"label": label, "w": w, "expire_at": channel.expire_at})
         return {"label": label, "w": w, "expire_at": channel.expire_at, "with": self.name_for_key(key) or key, "address_sent_to": reply_to}
 
     # ----------------------------------------------------------- lookup --
@@ -2055,12 +2164,30 @@ class Runtime:
             return
         self.closed = True
         self.stop.set()
+        self._wait_for_threads()
         try:
             self.save_state()
             self.save_outbox()
         finally:
+            self._let_go()
             self._release_lock()
+
+    def _wait_for_threads(self):
+        """A moment for the threads to finish what they hold, and no longer."""
+        until = time.time() + self.CLOSE_WAIT
+        threads = [channel.poller for channel in list(getattr(self, "channels", {}).values()) if channel.poller is not None]
+        if getattr(self, "listener", None) is not None:
+            threads.append(self.listener)
+        for thread in threads:
+            if thread is not threading.current_thread():
+                thread.join(max(0.0, until - time.time()))
+
+    def _let_go(self):
+        """From here on this runtime writes nothing: the home may be another process's."""
+        with getattr(self, "lock", None) or threading.RLock():
+            self.home_released = True
 
     def release(self):
         """Lets go of the home without saving, for a command that saved what it changed as it went."""
+        self._let_go()
         self._release_lock()
